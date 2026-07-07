@@ -19,18 +19,20 @@ class Settings:
     venue: str
     symbol: str
     ob_depth: int
+    testnet: bool
     credentials: dict[str, VenueCredentials] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> Settings:
         load_dotenv(Path(__file__).parent / ".env")
 
-        venue = os.getenv("VENUE", "binance")
+        venue = os.getenv("VENUE", "deribit")
         return cls(
             dry_run=os.getenv("DRY_RUN", "true").lower() != "false",
             venue=venue,
-            symbol=os.getenv("SYMBOL", "BTC/USDT"),
+            symbol=os.getenv("SYMBOL", "BTC-PERPETUAL"),
             ob_depth=int(os.getenv("OB_DEPTH", "20")),
+            testnet=os.getenv("TESTNET", "false").lower() == "true",
             credentials={
                 venue: VenueCredentials(
                     api_key=os.getenv(f"{venue.upper()}_API_KEY", ""),
