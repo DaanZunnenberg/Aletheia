@@ -25,6 +25,16 @@ class OrderBook:
         return self._bids.shape[0] > 0 and self._asks.shape[0] > 0
 
     @property
+    def bids(self) -> np.ndarray:
+        """All bid levels as (price, qty) array, descending by price."""
+        return self._bids
+
+    @property
+    def asks(self) -> np.ndarray:
+        """All ask levels as (price, qty) array, ascending by price."""
+        return self._asks
+
+    @property
     def best_bid(self) -> float:
         return float(self._bids[0, 0])
 
