@@ -5,7 +5,7 @@ from typing import AsyncIterator, Any
 
 import orjson
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .types import (
     FundingRate, IndexPrice, OptionMarkPrice, OrderBookSnapshot,
@@ -20,7 +20,7 @@ _WS_TEST = "wss://test.deribit.com/ws/api/v2"
 
 _VALID_DEPTHS = (1, 5, 10, 20)
 
-_HB_REPLY = orjson.dumps({"jsonrpc": "2.0", "method": "public/test", "params": {}, "id": 0})
+_HB_REPLY = orjson.dumps({"jsonrpc": "2.0", "method": "public/test", "params": {}, "id": 0}).decode()
 
 
 def _nearest_depth(n: int) -> int:
@@ -38,10 +38,10 @@ async def _sub_stream(url: str, channels: list[str]) -> AsyncIterator[tuple[str,
     sub = orjson.dumps({
         "jsonrpc": "2.0", "method": "public/subscribe",
         "params": {"channels": channels}, "id": 1,
-    })
+    }).decode()
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None) as ws:
+            async with websockets.connect(url, ping_interval=None, open_timeout=20) as ws:
                 await ws.send(sub)
                 async for raw in ws:
                     msg = orjson.loads(raw)
@@ -51,7 +51,7 @@ async def _sub_stream(url: str, channels: list[str]) -> AsyncIterator[tuple[str,
                         continue
                     if msg.get("method") == "subscription":
                         yield msg["params"]["channel"], msg["params"]["data"]
-        except (ConnectionClosed, OSError) as exc:
+        except (WebSocketException, OSError, TimeoutError) as exc:
             log.warning("WS dropped (%s) — reconnecting in 1 s", exc)
             await asyncio.sleep(1)
 
@@ -100,10 +100,10 @@ class DeribitConnector:
         sub = orjson.dumps({
             "jsonrpc": "2.0", "method": "public/subscribe",
             "params": {"channels": [channel]}, "id": 1,
-        })
+        }).decode()
 
         try:
-            async with websockets.connect(self._url, ping_interval=None) as ws:
+            async with websockets.connect(self._url, ping_interval=None, open_timeout=20) as ws:
                 await ws.send(sub)
                 async for raw in ws:
                     msg = orjson.loads(raw)
@@ -153,7 +153,7 @@ class DeribitConnector:
                             asks=sorted(asks.items())[:depth],
                             timestamp=float(data["timestamp"]),
                         )
-        except (ConnectionClosed, OSError) as exc:
+        except (WebSocketException, OSError, TimeoutError) as exc:
             log.warning("book stream dropped (%s) — reconnecting in 1 s", exc)
             await asyncio.sleep(1)
 

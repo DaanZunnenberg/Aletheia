@@ -6,23 +6,24 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+_ENV = Path(__file__).parent / ".env"
+
 
 @dataclass
 class Settings:
-    dry_run: bool
-    symbol: str
-    ob_depth: int
-    testnet: bool
-    api_key: str
-    api_secret: str
+    # Strategy / runtime parameters — edit here, not in .env
+    dry_run: bool = True
+    symbol: str = "BTC-PERPETUAL"
+    ob_depth: int = 20
+    testnet: bool = False
+    # Credentials — loaded from config/.env, never hardcoded
+    api_key: str = ""
+    api_secret: str = ""
 
     @classmethod
     def load(cls) -> Settings:
-        load_dotenv(Path(__file__).parent / ".env")
+        load_dotenv(_ENV)
         return cls(
-            dry_run=os.getenv("DRY_RUN", "true").lower() != "false",
-            symbol=os.getenv("SYMBOL", "BTC-PERPETUAL"),
-            ob_depth=int(os.getenv("OB_DEPTH", "20")),
             testnet=os.getenv("TESTNET", "false").lower() == "true",
             api_key=os.getenv("DERIBIT_API_KEY", ""),
             api_secret=os.getenv("DERIBIT_API_SECRET", ""),
