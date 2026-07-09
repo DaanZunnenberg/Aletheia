@@ -262,6 +262,8 @@ class DeribitConnector:
     # ------------------------------------------------------------------
 
     async def watch_volatility_index(self, index_name: str) -> AsyncIterator[VolatilityIndex]:
+        # Deribit uses the price index name as the channel param (btc_usd, eth_usd),
+        # not a dedicated dvol name (btc_dvol does not work).
         channel = f"deribit_volatility_index.{index_name}"
         async with aiohttp.ClientSession() as session:
             async for _, data in _sub_stream(session, self._url, [channel]):
@@ -269,10 +271,6 @@ class DeribitConnector:
                     index_name=data["index_name"],
                     timestamp=float(data["timestamp"]),
                     volatility=float(data["volatility"]),
-                    open=float(data["open"]),
-                    high=float(data["high"]),
-                    low=float(data["low"]),
-                    close=float(data["close"]),
                 )
 
     # ------------------------------------------------------------------
@@ -280,17 +278,20 @@ class DeribitConnector:
     # ------------------------------------------------------------------
 
     async def watch_mark_prices(self, index_name: str) -> AsyncIterator[list[OptionMarkPrice]]:
+        # markprice.options is a differential channel: each message contains only
+        # the options whose mark price changed since the last message, not the full
+        # chain. Merge into a cache so every yield returns the complete option set.
         channel = f"markprice.options.{index_name}"
+        cache: dict[str, OptionMarkPrice] = {}
         async with aiohttp.ClientSession() as session:
             async for _, data in _sub_stream(session, self._url, [channel]):
-                yield [
-                    OptionMarkPrice(
+                for entry in data:
+                    cache[entry["instrument_name"]] = OptionMarkPrice(
                         instrument_name=entry["instrument_name"],
                         mark_price=float(entry["mark_price"]),
                         mark_iv=float(entry["iv"]),
                     )
-                    for entry in data
-                ]
+                yield list(cache.values())
 
     # ------------------------------------------------------------------
     # Perpetual funding rate

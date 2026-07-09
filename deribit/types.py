@@ -60,14 +60,14 @@ class IndexPrice(TypedDict):
 
 
 class VolatilityIndex(TypedDict):
-    """Deribit Volatility Index (DVOL) — 30-day forward-looking IV derived from option prices."""
-    index_name: str   # e.g. 'btc_dvol', 'eth_dvol'
+    """Deribit Volatility Index (DVOL) — 30-day forward-looking IV derived from option prices.
+
+    Channel: deribit_volatility_index.btc_usd  (note: NOT btc_dvol — Deribit uses the
+    price index name, not a dedicated dvol name, as the channel parameter).
+    """
+    index_name: str   # matches channel param, e.g. 'btc_usd', 'eth_usd'
     timestamp: float
     volatility: float  # current DVOL value (annualised %)
-    open: float
-    high: float
-    low: float
-    close: float
 
 
 class OptionMarkPrice(TypedDict):
