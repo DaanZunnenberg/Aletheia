@@ -1,10 +1,10 @@
 import asyncio
 
 from config.settings import Settings
-from data.feed import MarketDataFeed
+from data.feed import DeribitFeed
 from data.orderbook import OrderBook
-from exchange.base import OrderBookSnapshot
-from exchange.registry import get_connector
+from deribit import DeribitConnector
+from deribit.types import OrderBookSnapshot
 from utils.logger import get_logger
 
 log = get_logger("aletheia")
@@ -12,28 +12,23 @@ log = get_logger("aletheia")
 
 async def main() -> None:
     settings = Settings.load()
-    log.info("venue=%s  symbol=%s  dry_run=%s", settings.venue, settings.symbol, settings.dry_run)
+    log.info("symbol=%s  testnet=%s  dry_run=%s", settings.symbol, settings.testnet, settings.dry_run)
 
-    creds = settings.credentials[settings.venue]
-    connector = get_connector(settings.venue, creds.api_key, creds.api_secret, testnet=settings.testnet)
+    connector = DeribitConnector(settings.api_key, settings.api_secret, testnet=settings.testnet)
     book = OrderBook()
-    feed = MarketDataFeed(connector)
+    feed = DeribitFeed(connector)
 
     def on_book(snapshot: OrderBookSnapshot) -> None:
         book.update(snapshot)
         if book.ready:
             log.info(
-                "bid=%.2f  ask=%.2f  spread=%.2f  mid=%.2f  μprice=%.2f  imbal=%+.3f",
+                "bid=%.2f  ask=%.2f  spread=%.4f  mid=%.4f  μprice=%.4f  imbal=%+.3f",
                 book.best_bid, book.best_ask, book.spread,
                 book.mid, book.microprice, book.imbalance,
             )
 
     feed.on_order_book(on_book)
-
-    try:
-        await feed.run(settings.symbol, depth=settings.ob_depth)
-    finally:
-        await connector.close()
+    await feed.run_order_book(settings.symbol, depth=settings.ob_depth)
 
 
 if __name__ == "__main__":

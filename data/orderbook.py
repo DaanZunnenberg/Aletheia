@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import numpy as np
 
-from exchange.base import OrderBookSnapshot
+from deribit.types import OrderBookSnapshot
 
 
 class OrderBook:
-    __slots__ = ("_symbol", "_bids", "_asks", "_timestamp")
+    __slots__ = ("_instrument", "_bids", "_asks", "_timestamp")
 
     def __init__(self) -> None:
-        self._symbol: str = ""
+        self._instrument: str = ""
         self._bids: np.ndarray = np.empty((0, 2), dtype=float)
         self._asks: np.ndarray = np.empty((0, 2), dtype=float)
         self._timestamp: float = 0.0
 
     def update(self, snapshot: OrderBookSnapshot) -> None:
-        self._symbol = snapshot["symbol"]
+        self._instrument = snapshot["instrument_name"]
         self._bids = np.array(snapshot["bids"], dtype=float)
         self._asks = np.array(snapshot["asks"], dtype=float)
         self._timestamp = snapshot["timestamp"]
@@ -23,6 +23,14 @@ class OrderBook:
     @property
     def ready(self) -> bool:
         return self._bids.shape[0] > 0 and self._asks.shape[0] > 0
+
+    @property
+    def instrument(self) -> str:
+        return self._instrument
+
+    @property
+    def timestamp(self) -> float:
+        return self._timestamp
 
     @property
     def bids(self) -> np.ndarray:
