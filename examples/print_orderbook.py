@@ -22,7 +22,7 @@ from data.orderbook import OrderBook
 from deribit import DeribitConnector
 from deribit.types import OrderBookSnapshot
 
-LEVELS = 5
+LEVELS = 25
 
 _RESET = "\033[0m"
 _RED = "\033[31m"
@@ -62,7 +62,9 @@ def print_book(book: OrderBook, levels: int = LEVELS) -> None:
 
 async def main() -> None:
     settings = Settings.load()
-    connector = DeribitConnector(settings.api_key, settings.api_secret, testnet=settings.testnet)
+    # Public market data always reads from mainnet — testnet has no active book.
+    # Private API calls (orders, account) honour settings.testnet.
+    connector = DeribitConnector(testnet=False)
     book = OrderBook()
     feed = DeribitFeed(connector)
 

@@ -13,7 +13,6 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 
-from config.settings import Settings
 from deribit import DeribitConnector
 from deribit.types import IndexPrice, VolatilityIndex
 
@@ -44,8 +43,8 @@ async def main() -> None:
     index_name = f"{currency}_usd"
     dvol_name = f"{currency}_dvol"
 
-    settings = Settings.load()
-    connector = DeribitConnector(settings.api_key, settings.api_secret, testnet=settings.testnet)
+    # Public market data always reads from mainnet.
+    connector = DeribitConnector(testnet=False)
 
     print(f"Streaming {index_name} index price and {dvol_name} DVOL …\n")
     print(f"{'TIME':>8}  {'CHANNEL':>10}  {'VALUE':>12}  NOTE")

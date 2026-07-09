@@ -14,7 +14,6 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 
-from config.settings import Settings
 from deribit import DeribitConnector, DeribitREST
 from deribit.types import OptionMarkPrice
 
@@ -72,9 +71,9 @@ async def main() -> None:
     currency = sys.argv[1].upper() if len(sys.argv) > 1 else "BTC"
     index_name = f"{currency.lower()}_usd"
 
-    settings = Settings.load()
-    rest = DeribitREST(settings.api_key, settings.api_secret, testnet=settings.testnet)
-    connector = DeribitConnector(settings.api_key, settings.api_secret, testnet=settings.testnet)
+    # Public market data always reads from mainnet.
+    rest = DeribitREST(testnet=False)
+    connector = DeribitConnector(testnet=False)
 
     idx = await rest.get_index_price(index_name)
     index_price = idx["price"]
