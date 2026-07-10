@@ -47,7 +47,7 @@ PAIR_SEP = "  ║  "   # 5-char separator between the two pairs
 PAIRS = [
     ("BTC-PERPETUAL", "BTC_USDC"),
     ("ETH-PERPETUAL", "ETH_USDC"),
-    ("SOL_USDC-PERPETUAL", "SOL_USDC"),
+    # ("SOL_USDC-PERPETUAL", "SOL_USDC"),
 ]
 
 _RESET = "\033[0m"
