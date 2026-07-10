@@ -33,6 +33,9 @@ config/.env
 .DS_Store
 Thumbs.db
 
-# Runtime
-runtime/
+# Runtime outputs (keep the directory, ignore contents)
+runtime/*
+!runtime/.gitkeep
 *.log
+*.jsonl
+*.wal
