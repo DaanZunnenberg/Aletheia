@@ -1,8 +1,8 @@
 # Aletheia
 
-An options implied distribution arbitrage research and trading framework targeting Deribit BTC and ETH options.
+An options arbitrage research and trading framework targeting Deribit BTC and ETH options.
 
-The core idea: extract the risk-neutral distribution Q from live option prices via Breeden-Litzenberger, estimate the physical distribution P from realised returns, and trade the divergence between them — vol carry, skew carry, or tail mispricing — using delta-neutral option spreads.
+The core idea: identify and exploit systematic mispricings in Deribit option prices using quantitative models and delta-neutral positions.
 
 ## Architecture
 
@@ -19,9 +19,9 @@ main.py           — research entry point
 
 - `core/market_state.py` — `OptionQuote`, `FutureQuote`, `MarketState` domain model
 - `core/options/surface.py` — IV surface construction (log-moneyness, cubic spline per expiry)
-- `core/options/risk_neutral_distribution.py` — Breeden-Litzenberger RND extraction
-- `core/models/physical_distribution.py` — log-normal historical P distribution
-- `core/signals/distribution_arbitrage.py` — KL divergence, Wasserstein-1, vol/skew signals
+- `core/options/risk_neutral_distribution.py` — implied distribution extraction from option prices
+- `core/models/physical_distribution.py` — statistical distribution models from realised data
+- `core/signals/` — signal generation from distribution and pricing analysis
 - `core/strategies/option_relative_value.py` — delta-neutral trade decisions
 - `core/risk/` — Greek exposure aggregation and hard position limits
 - `core/_math.py` — shared CDF, moment, and tail probability utilities
@@ -32,9 +32,8 @@ main.py           — research entry point
 Deribit REST → fetch option chain + futures curve + spot index
              → normalise to MarketState
              → build IV surface (cubic spline per expiry)
-             → extract RND via Breeden-Litzenberger (Q)
-             → compare against historical P distribution
-             → compute KL divergence + Wasserstein-1 + vol/skew signals
+             → extract implied distribution from option prices
+             → generate signals from pricing and distribution analysis
              → generate delta-neutral trade decisions
              → enforce risk limits → emit orders (dry-run by default)
 ```
@@ -85,13 +84,7 @@ The quoting loop and live strategy execution live in `core/strategies/` (private
 
 ## Mathematical Specification
 
-See `core/MODEL.md` in the private submodule for the full mathematical specification covering:
-
-- Breeden-Litzenberger RND extraction: f^Q(K) = e^(rT) · d²C/dK²
-- IV surface parameterisation (log-moneyness normalisation, cubic spline)
-- Physical distribution estimation (log-normal, EWMA volatility)
-- Signal construction (KL divergence, Wasserstein-1 distance)
-- Delta-neutral trade construction and Greek risk aggregation
+See `core/MODEL.md` in the private submodule for the full mathematical specification.
 
 ## Risk Defaults
 

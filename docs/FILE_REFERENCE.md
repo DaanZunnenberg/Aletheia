@@ -11,7 +11,7 @@ Status: `active` | `stub` | `placeholder` (intentionally empty, documents future
 
 | Layer | Visibility | Contents |
 |-------|-----------|----------|
-| `core/` | **Private** (submodule) | Market state domain model, options analytics, physical distribution models, signal generation, strategy, risk management |
+| `core/` | **Private** (submodule) | Market state domain model, options analytics, distribution models, signal generation, strategy, risk management |
 | Everything else | **Public** | Exchange connectors, data fetching, normalization, config, utilities, research notebooks, future backtesting framework |
 
 The public repo contains zero model or strategy logic. `core/` contains zero connector or I/O code.
@@ -24,9 +24,9 @@ The public repo contains zero model or strategy logic. `core/` contains zero con
 aletheia/                       ← public repo
 ├── core/                       ← private submodule (aletheia-core)
 │   ├── market_state.py         ← domain model: MarketState, OptionQuote, FutureQuote
-│   ├── options/                ← IV surface, calibration, Breeden-Litzenberger RND
-│   ├── models/                 ← physical distribution models, vol forecasting
-│   ├── signals/                ← Q vs P distribution comparison engine
+│   ├── options/                ← IV surface, calibration, implied distribution extraction
+│   ├── models/                 ← statistical distribution models, vol forecasting
+│   ├── signals/                ← signal generation from pricing and distribution analysis
 │   ├── strategies/             ← trade decision generation
 │   ├── risk/                   ← Greek aggregation, position limits
 │   └── MODEL.md                ← full mathematical specification
@@ -53,8 +53,8 @@ aletheia/                       ← public repo
 2. `deribit/rest.py` — open async REST session
 3. `data/normalization.py` — fetch raw Deribit data, normalise into `core.MarketState`
 4. `core/options/surface.py` — build IV surface from `MarketState`
-5. `core/options/risk_neutral_distribution.py` — extract Q density per expiry (Breeden-Litzenberger)
-6. `core/signals/distribution_arbitrage.py` — compare Q vs P, emit `DistributionSignal`
+5. `core/options/risk_neutral_distribution.py` — extract implied distribution per expiry
+6. `core/signals/distribution_arbitrage.py` — generate signals, emit `DistributionSignal`
 7. `core/strategies/option_relative_value.py` — translate signal into `TradeDecision` (risk-checked)
 
 ---
@@ -75,20 +75,20 @@ All model, strategy, and risk logic. See `core/MODEL.md` for the full mathematic
 |------|---------|--------|
 | `core/options/surface.py` | `IVSlice`, `IVSurface`, `build_surface()`. Cubic spline on log-moneyness `m = log(K/F)`, one slice per expiry, calls only | active |
 | `core/options/calibration.py` | Placeholder for SVI and SABR parametric surface calibration | placeholder |
-| `core/options/risk_neutral_distribution.py` | `RiskNeutralDistribution`, `extract_risk_neutral_distribution()`. Breeden-Litzenberger via numerical second derivative of the Black-76 call price grid. Outputs normalised density, CDF, moments, tail probabilities, validity flag | active |
+| `core/options/risk_neutral_distribution.py` | `RiskNeutralDistribution`, `extract_risk_neutral_distribution()`. Extracts the implied distribution from option prices. Outputs normalised density, CDF, moments, tail probabilities, validity flag | active |
 
-### Physical distribution models (`core/models/`)
+### Statistical distribution models (`core/models/`)
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `core/models/physical_distribution.py` | `PhysicalDistributionModel` ABC, `PhysicalDistribution` dataclass, `LogNormalHistoricalModel` baseline (lognormal from realised vol) | active |
+| `core/models/physical_distribution.py` | `PhysicalDistributionModel` ABC, `PhysicalDistribution` dataclass, `LogNormalHistoricalModel` baseline | active |
 | `core/models/volatility_models.py` | Placeholder for GARCH(1,1), Heston, EWMA vol forecasting | placeholder |
 
 ### Signal generation (`core/signals/`)
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `core/signals/distribution_arbitrage.py` | `DistributionSignal`, `compare_distributions()`. KL divergence, Wasserstein-1, variance diff, skew diff, tail probability differences (Q vs P). Emits direction and suggested trade structure | active |
+| `core/signals/distribution_arbitrage.py` | `DistributionSignal`, `compare_distributions()`. Generates arbitrage signals from pricing and distribution analysis. Emits direction and suggested trade structure | active |
 
 ### Strategy (`core/strategies/`)
 
@@ -194,6 +194,6 @@ Connectivity diagnostics. Run manually to verify credentials and feeds.
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Research entry point: fetch option chain → build surface → extract RND → print summary |
+| `main.py` | Research entry point: fetch option chain → build surface → extract implied distribution → print summary |
 | `pyproject.toml` | Package metadata and dependencies (`scipy` added for surface interpolation) |
 | `CLAUDE.md` | Project instructions for Claude Code |

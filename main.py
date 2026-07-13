@@ -1,8 +1,8 @@
 """
-Aletheia — option implied distribution arbitrage framework.
+Aletheia — options arbitrage research framework.
 
 Research entry point: fetch a full Deribit option chain, build the IV surface,
-extract the risk-neutral distribution per expiry, and print a summary.
+extract implied distributions per expiry, and print a summary.
 """
 from __future__ import annotations
 
