@@ -21,7 +21,7 @@ _PRODUCTION_WARNING = """\
 """
 
 
-@dataclass
+@dataclass(frozen=True)
 class Settings:
     dry_run: bool = True
     testnet: bool = True

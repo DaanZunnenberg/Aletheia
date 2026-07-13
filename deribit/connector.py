@@ -155,10 +155,19 @@ class DeribitConnector:
 
                     elif data["type"] == "change":
                         if last_change_id is None or data["prev_change_id"] != last_change_id:
+                            # Gap in change_id sequence: the book state is corrupt.
+                            # Break to close this WS connection; the outer while-True in
+                            # watch_order_book will reconnect and receive a fresh snapshot.
+                            log.warning(
+                                "book: change_id gap for %s (expected %s, got %s) — reconnecting",
+                                instrument,
+                                last_change_id,
+                                data.get("prev_change_id"),
+                            )
                             bids.clear()
                             asks.clear()
                             last_change_id = None
-                            continue
+                            break
 
                         for action, price, qty in data["bids"]:
                             p = float(price)

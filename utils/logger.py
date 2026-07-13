@@ -1,5 +1,8 @@
 import logging
+import os
 import sys
+
+_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -11,5 +14,6 @@ def get_logger(name: str) -> logging.Logger:
             datefmt="%H:%M:%S",
         ))
         logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(_LEVEL)
+        logger.propagate = False
     return logger
