@@ -3,80 +3,123 @@
 Living reference for every file in the project. Update whenever a file is added,
 removed, or its functionality or status changes.
 
-Status: `active` | `stub` (skeleton only) | `placeholder` (intentionally empty, documents future intent)
+Status: `active` | `stub` | `placeholder` (intentionally empty, documents future intent)
+
+---
+
+## Repository Boundary
+
+| Layer | Visibility | Contents |
+|-------|-----------|----------|
+| `core/` | **Private** (submodule) | Market state domain model, options analytics, physical distribution models, signal generation, strategy, risk management |
+| Everything else | **Public** | Exchange connectors, data fetching, normalization, config, utilities, research notebooks, future backtesting framework |
+
+The public repo contains zero model or strategy logic. `core/` contains zero connector or I/O code.
 
 ---
 
 ## Repository Layout
 
 ```
-aletheia/
-├── core/                   ← private submodule (aletheia-core)
-│   ├── options/            ← IV surface, calibration, Breeden-Litzenberger
-│   ├── models/             ← physical distribution models
-│   └── signals/            ← Q vs P comparison engine
-├── deribit/                ← native Deribit REST + WebSocket connectors
-├── exchange/               ← generic exchange connector abstractions
-├── data/                   ← market state dataclasses + normalization
-├── strategies/             ← strategy orchestration (thin, imports from core)
-├── risk/                   ← Greek aggregation + position limits
-├── execution/              ← order routing (placeholder)
-├── research/notebooks/     ← Jupyter notebooks for exploratory work
-├── config/                 ← settings, secrets
-├── utils/                  ← shared utilities
-├── checks/                 ← connectivity diagnostics
-├── examples/               ← runnable data feed examples
-├── docs/                   ← this file
-└── main.py                 ← research entry point
+aletheia/                       ← public repo
+├── core/                       ← private submodule (aletheia-core)
+│   ├── market_state.py         ← domain model: MarketState, OptionQuote, FutureQuote
+│   ├── options/                ← IV surface, calibration, Breeden-Litzenberger RND
+│   ├── models/                 ← physical distribution models, vol forecasting
+│   ├── signals/                ← Q vs P distribution comparison engine
+│   ├── strategies/             ← trade decision generation
+│   ├── risk/                   ← Greek aggregation, position limits
+│   └── MODEL.md                ← full mathematical specification
+├── deribit/                    ← native Deribit REST + WebSocket connectors
+├── exchange/                   ← generic connector abstractions (CCXT etc.)
+├── data/
+│   └── normalization.py        ← raw Deribit types → core domain types
+├── execution/                  ← order routing (placeholder)
+├── research/
+│   └── notebooks/              ← Jupyter notebooks for exploratory work
+├── config/                     ← settings, secrets
+├── utils/                      ← shared utilities (logger)
+├── checks/                     ← connectivity diagnostics
+├── examples/                   ← runnable data feed examples
+├── docs/                       ← this file
+└── main.py                     ← research entry point
 ```
-
-**Boundary:** The public repo owns connectors, data structures, orchestration, and infrastructure.
-`core/` owns all proprietary model logic. Nothing outside `core/` should contain pricing or signal models.
 
 ---
 
 ## Startup Sequence (main.py)
 
 1. `config/settings.py` — load environment and credentials
-2. `deribit/rest.py` — open REST session
-3. `data/normalization.py` — fetch and normalise option chain into `MarketState`
-4. `core/options/surface.py` — build IV surface
-5. `core/options/risk_neutral_distribution.py` — extract Q density per expiry
-6. `core/signals/distribution_arbitrage.py` — compare Q vs P, generate signals
+2. `deribit/rest.py` — open async REST session
+3. `data/normalization.py` — fetch raw Deribit data, normalise into `core.MarketState`
+4. `core/options/surface.py` — build IV surface from `MarketState`
+5. `core/options/risk_neutral_distribution.py` — extract Q density per expiry (Breeden-Litzenberger)
+6. `core/signals/distribution_arbitrage.py` — compare Q vs P, emit `DistributionSignal`
+7. `core/strategies/option_relative_value.py` — translate signal into `TradeDecision` (risk-checked)
 
 ---
 
 ## core/ (private submodule — aletheia-core)
 
-Model implementations. All proprietary logic lives here. See `core/MODEL.md` for the full mathematical specification.
+All model, strategy, and risk logic. See `core/MODEL.md` for the full mathematical specification.
+
+### Domain model
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `core/MODEL.md` | Mathematical specification: IV surface, Breeden-Litzenberger, physical distribution models, signal construction | active |
-| `core/options/surface.py` | `IVSlice`, `IVSurface`, `build_surface()`. Cubic spline on log-moneyness `m = log(K/F)`. One slice per expiry, calls only | active |
-| `core/options/calibration.py` | Placeholder for SVI and SABR parametric calibration | placeholder |
-| `core/options/risk_neutral_distribution.py` | `RiskNeutralDistribution`, `extract_risk_neutral_distribution()`. Breeden-Litzenberger via numerical second derivative on Black-76 call price grid. Outputs normalised density, CDF, moments, tail probs, validity flag | active |
-| `core/models/physical_distribution.py` | `PhysicalDistributionModel` ABC + `LogNormalHistoricalModel` (lognormal from realised vol). `PhysicalDistribution` dataclass | active |
+| `core/market_state.py` | `MarketState`, `OptionQuote`, `FutureQuote` dataclasses. The canonical in-memory representation of a market snapshot. Convenience methods: `calls()`, `puts()`, `expiries()`, `perpetual()`, `forward()` | active |
+
+### Options analytics (`core/options/`)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `core/options/surface.py` | `IVSlice`, `IVSurface`, `build_surface()`. Cubic spline on log-moneyness `m = log(K/F)`, one slice per expiry, calls only | active |
+| `core/options/calibration.py` | Placeholder for SVI and SABR parametric surface calibration | placeholder |
+| `core/options/risk_neutral_distribution.py` | `RiskNeutralDistribution`, `extract_risk_neutral_distribution()`. Breeden-Litzenberger via numerical second derivative of the Black-76 call price grid. Outputs normalised density, CDF, moments, tail probabilities, validity flag | active |
+
+### Physical distribution models (`core/models/`)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `core/models/physical_distribution.py` | `PhysicalDistributionModel` ABC, `PhysicalDistribution` dataclass, `LogNormalHistoricalModel` baseline (lognormal from realised vol) | active |
 | `core/models/volatility_models.py` | Placeholder for GARCH(1,1), Heston, EWMA vol forecasting | placeholder |
-| `core/signals/distribution_arbitrage.py` | `DistributionSignal`, `compare_distributions()`. Computes KL divergence, Wasserstein-1, variance/skew/tail diffs between Q and P. Produces direction and suggested trade | active |
+
+### Signal generation (`core/signals/`)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `core/signals/distribution_arbitrage.py` | `DistributionSignal`, `compare_distributions()`. KL divergence, Wasserstein-1, variance diff, skew diff, tail probability differences (Q vs P). Emits direction and suggested trade structure | active |
+
+### Strategy (`core/strategies/`)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `core/strategies/option_relative_value.py` | `TradeDecision`, `generate_decision()`. Translates `DistributionSignal` into a sized, risk-checked trade instruction | active |
+
+### Risk management (`core/risk/`)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `core/risk/greeks.py` | `GreekExposure`, `Position`, `compute_exposure()`. Aggregates net and gross Greeks (delta, gamma, vega, theta) across open option positions | active |
+| `core/risk/limits.py` | `RiskLimits` dataclass: hard caps on vega, delta, gamma, notional. `RiskLimits.conservative()` preset | active |
 
 ---
 
-## deribit/
+## deribit/ (public)
 
 Native async Deribit connectors. Do not modify without updating both REST and WS layers.
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `deribit/types.py` | TypedDicts for all Deribit objects: `Ticker`, `Trade`, `Instrument`, `OrderBookSnapshot`, `IndexPrice`, `VolatilityIndex`, `OptionMarkPrice`, `FundingRate` | active |
+| `deribit/types.py` | TypedDicts for all Deribit wire types: `Ticker`, `Trade`, `Instrument`, `OrderBookSnapshot`, `IndexPrice`, `VolatilityIndex`, `OptionMarkPrice`, `FundingRate` | active |
 | `deribit/rest.py` | `DeribitREST`: async REST client. `get_instruments`, `get_ticker`, `get_order_book`, `get_index_price`, `get_last_trades`, `get_historical_volatility` | active |
 | `deribit/connector.py` | `DeribitConnector`: WebSocket streams. `watch_order_book`, `watch_trades`, `watch_ticker`, `watch_index`, `watch_volatility_index`, `watch_mark_prices`, `watch_funding` | active |
 
 ---
 
-## exchange/
+## exchange/ (public)
 
-Generic connector abstractions for non-Deribit venues. Kept for modularity; not used by the primary research pipeline.
+Generic connector abstractions for non-Deribit venues. Modular; not used by the primary research pipeline.
 
 | File | Purpose | Status |
 |------|---------|--------|
@@ -87,59 +130,37 @@ Generic connector abstractions for non-Deribit venues. Kept for modularity; not 
 
 ---
 
-## data/
+## data/ (public)
 
-Market state representation and normalization. Data structures only — no model logic.
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `data/market_state.py` | `MarketState`, `OptionQuote`, `FutureQuote` dataclasses. Central snapshot object consumed by all models. Convenience methods: `calls()`, `puts()`, `expiries()`, `perpetual()`, `forward()` | active |
-| `data/normalization.py` | Converts raw `deribit.types` objects to domain types. `ticker_to_option_quote()`, `ticker_to_future_quote()`, `build_market_state()` | active |
-
----
-
-## strategies/
-
-Strategy orchestration. Thin layer: consumes `core.signals`, applies risk limits, produces `TradeDecision`.
+Data normalization pipeline. Converts raw exchange wire types into core domain objects. No model logic.
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `strategies/option_relative_value.py` | `TradeDecision`, `generate_decision()`. Translates `DistributionSignal` into sized, risk-checked trade instruction | active |
+| `data/normalization.py` | `ticker_to_option_quote()`, `ticker_to_future_quote()`, `build_market_state()`. Transforms raw `deribit.types` objects into `core.market_state` types | active |
+
+*Future additions: `data/feed.py` (live WebSocket feed manager), `data/storage.py` (historical snapshot persistence).*
 
 ---
 
-## risk/
+## execution/ (public, placeholder)
 
-Portfolio risk management. Greek aggregation and hard position limits.
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `risk/greeks.py` | `GreekExposure`, `Position`, `compute_exposure()`. Aggregates net/gross Greeks across open positions | active |
-| `risk/limits.py` | `RiskLimits` dataclass: max vega, delta, gamma, notional. `RiskLimits.conservative()` preset | active |
+Order routing. Not yet implemented. Will remain public (infrastructure).
 
 ---
 
-## execution/
-
-Order routing. Not yet implemented.
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `execution/__init__.py` | Package marker | placeholder |
-
----
-
-## research/
+## research/ (public)
 
 Jupyter notebooks for exploratory research. No production code lives here.
 
 | Path | Purpose |
 |------|---------|
-| `research/notebooks/` | Working notebooks: surface inspection, RND extraction, signal backtesting |
+| `research/notebooks/` | Surface inspection, RND extraction, signal backtesting |
+
+*Future: a backtesting framework (e.g. vectorbt, backtesting.py, or custom) will be integrated here and remain public.*
 
 ---
 
-## config/
+## config/ (public)
 
 | File | Purpose | Status |
 |------|---------|--------|
@@ -149,7 +170,7 @@ Jupyter notebooks for exploratory research. No production code lives here.
 
 ---
 
-## utils/
+## utils/ (public)
 
 | File | Purpose | Status |
 |------|---------|--------|
@@ -157,7 +178,7 @@ Jupyter notebooks for exploratory research. No production code lives here.
 
 ---
 
-## checks/
+## checks/ (public)
 
 Connectivity diagnostics. Run manually to verify credentials and feeds.
 
@@ -173,6 +194,6 @@ Connectivity diagnostics. Run manually to verify credentials and feeds.
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Research entry point: fetch option chain, build IV surface, extract RND, print summary |
-| `pyproject.toml` | Package metadata and dependencies |
+| `main.py` | Research entry point: fetch option chain → build surface → extract RND → print summary |
+| `pyproject.toml` | Package metadata and dependencies (`scipy` added for surface interpolation) |
 | `CLAUDE.md` | Project instructions for Claude Code |

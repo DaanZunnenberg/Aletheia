@@ -11,7 +11,7 @@ import asyncio
 from config.settings import Settings
 from deribit.rest import DeribitREST
 from deribit.types import Ticker
-from data.market_state import FutureQuote, OptionQuote
+from core.market_state import FutureQuote, OptionQuote
 from data.normalization import build_market_state, ticker_to_future_quote, ticker_to_option_quote
 from core.options.surface import build_surface
 from core.options.risk_neutral_distribution import extract_risk_neutral_distribution

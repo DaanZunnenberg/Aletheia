@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from deribit.types import Instrument, Ticker
-from .market_state import FutureQuote, MarketState, OptionQuote
+from core.market_state import FutureQuote, MarketState, OptionQuote
 
 
 def ticker_to_option_quote(ticker: Ticker, instrument: Instrument) -> OptionQuote:

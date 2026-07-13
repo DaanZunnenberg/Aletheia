@@ -23,8 +23,6 @@ include = [
     "data*",
     "deribit*",
     "exchange*",
-    "strategies*",
-    "risk*",
     "execution*",
     "research*",
     "utils*",
