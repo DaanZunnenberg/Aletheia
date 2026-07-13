@@ -23,14 +23,11 @@ _PRODUCTION_WARNING = """\
 
 @dataclass
 class Settings:
-    # Runtime parameters — edit here, not in .env
     dry_run: bool = True
-    symbol: str = "BTC-PERPETUAL"
-    ob_depth: int = 20
-    # Populated by load()
     testnet: bool = True
     api_key: str = ""
     api_secret: str = ""
+    currencies: tuple[str, ...] = ("BTC", "ETH")   # underlying currencies to monitor
 
     @classmethod
     def load(cls) -> Settings:
@@ -45,8 +42,13 @@ class Settings:
             api_key = os.getenv("DERIBIT_API_KEY", "")
             api_secret = os.getenv("DERIBIT_API_SECRET", "")
 
+        currencies_env = os.getenv("CURRENCIES", "BTC,ETH")
+        currencies = tuple(c.strip().upper() for c in currencies_env.split(","))
+
         return cls(
+            dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
             testnet=testnet,
             api_key=api_key,
             api_secret=api_secret,
+            currencies=currencies,
         )
