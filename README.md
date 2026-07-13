@@ -1,113 +1,108 @@
 # Aletheia
 
-A crypto market making system. The edge comes from disciplined quote placement — earning the bid-ask spread while managing inventory risk, adverse selection, and market impact.
+An options implied distribution arbitrage research and trading framework targeting Deribit BTC and ETH options.
 
-## Strategy
-
-Market making P&L decomposes into three components:
-
-1. **Spread capture** — earned when both sides fill; the gross edge.
-2. **Inventory cost** — mark-to-market loss when position drifts in the wrong direction.
-3. **Adverse selection** — losses from trading against informed flow.
-
-Quote placement follows the **Avellaneda-Stoikov** stochastic control framework. The reservation price adjusts for inventory risk; the spread adjusts for realised volatility and order arrival rate. Spreads widen dynamically with volatility, inventory imbalance, and flow toxicity signals (VPIN, order book imbalance).
+The core idea: extract the risk-neutral distribution Q from live option prices via Breeden-Litzenberger, estimate the physical distribution P from realised returns, and trade the divergence between them — vol carry, skew carry, or tail mispricing — using delta-neutral option spreads.
 
 ## Architecture
 
 ```
-config/      — settings and secrets (.env, dry_run flag)
-exchange/    — venue connectors (native or CCXT-backed); all modules import from base.py only
-data/        — WebSocket feed manager, L2 order book state, derived signals
-core/        — quoting loop, pricing model, risk limits, portfolio/inventory state
-execution/   — order management, fill reconciliation, P&L tracking
-terminal/    — Textual TUI for live monitoring
-utils/       — dependency-free helpers
+deribit/          — async WebSocket + REST connectors (native aiohttp)
+data/             — market state normalisation (Deribit → internal types)
+config/           — settings and secrets (dry_run, testnet, API keys)
+utils/            — dependency-free helpers (logger)
+core/             — private submodule: model logic, strategies, risk
+main.py           — research entry point
 ```
 
-The runtime is fully asyncio-native. The quoting loop is driven by order book update callbacks, not a timer. `dry_run = True` by default — orders are logged but never sent until `DRY_RUN=false` is set in the environment.
+`core/` is a private git submodule ([aletheia-core](https://github.com/DaanZunnenberg/aletheia-core)) and is not included in this public repository. It contains:
 
-## Dependency Graph
+- `core/market_state.py` — `OptionQuote`, `FutureQuote`, `MarketState` domain model
+- `core/options/surface.py` — IV surface construction (log-moneyness, cubic spline per expiry)
+- `core/options/risk_neutral_distribution.py` — Breeden-Litzenberger RND extraction
+- `core/models/physical_distribution.py` — log-normal historical P distribution
+- `core/signals/distribution_arbitrage.py` — KL divergence, Wasserstein-1, vol/skew signals
+- `core/strategies/option_relative_value.py` — delta-neutral trade decisions
+- `core/risk/` — Greek exposure aggregation and hard position limits
+- `core/_math.py` — shared CDF, moment, and tail probability utilities
 
-Reflects actual internal imports in the current codebase (`core/`, `exchange/`, `execution/`, `terminal/` from the architecture above are not yet implemented — only `deribit/` exists as a live connector today).
+## Data Flow
 
-```mermaid
-graph LR
-    main[main.py]
-
-    subgraph config
-        settings[settings.py]
-    end
-
-    subgraph utils
-        logger[logger.py]
-    end
-
-    subgraph deribit
-        d_init["__init__.py"]
-        connector[connector.py]
-        rest[rest.py]
-        types[types.py]
-    end
-
-    subgraph data
-        feed[feed.py]
-        orderbook[orderbook.py]
-    end
-
-    subgraph checks
-        auth[auth.py]
-        c_rest[rest.py]
-        ws[ws.py]
-    end
-
-    subgraph examples
-        stream_index[stream_index.py]
-        print_orderbook[print_orderbook.py]
-        stream_options[stream_options.py]
-    end
-
-    main --> settings
-    main --> feed
-    main --> orderbook
-    main --> d_init
-    main --> types
-    main --> logger
-
-    auth --> settings
-    c_rest --> settings
-    ws --> settings
-
-    d_init --> connector
-    d_init --> rest
-    d_init --> types
-    connector --> types
-    connector --> logger
-    rest --> types
-    rest --> logger
-
-    feed --> connector
-    feed --> types
-    feed --> logger
-    orderbook --> types
-
-    stream_index --> d_init
-    stream_index --> types
-    print_orderbook --> orderbook
-    print_orderbook --> d_init
-    print_orderbook --> types
-    stream_options --> d_init
-    stream_options --> types
+```
+Deribit REST → fetch option chain + futures curve + spot index
+             → normalise to MarketState
+             → build IV surface (cubic spline per expiry)
+             → extract RND via Breeden-Litzenberger (Q)
+             → compare against historical P distribution
+             → compute KL divergence + Wasserstein-1 + vol/skew signals
+             → generate delta-neutral trade decisions
+             → enforce risk limits → emit orders (dry-run by default)
 ```
 
-## Venues
+## Setup
 
-Any exchange accessible via CCXT (REST + WebSocket) or a native connector. Priority targets: Binance, OKX, Bybit — liquid spot and perpetual markets with viable maker fee structures.
+**Requirements:** Python ≥ 3.10
 
-## Stack
+```bash
+git clone --recurse-submodules https://github.com/DaanZunnenberg/Aletheia.git
+cd Aletheia
+pip install -e .
+cp config/.env.example config/.env   # then fill in credentials
+python main.py
+```
 
-- Python 3.11+
-- `ccxt` / `ccxt.pro` for exchange connectivity
-- `aiohttp` + `websockets` for native connectors
-- `numpy` / `pandas` for signal computation
-- `orjson` for fast serialisation
-- `textual` for the TUI
+**Environment variables** (all optional; defaults are safe for research):
+
+| Variable | Default | Description |
+|---|---|---|
+| `TESTNET` | `true` | Connect to `test.deribit.com` (paper trading). Set `false` for live. |
+| `DRY_RUN` | `true` | Log orders but never send them. Set `false` only in production. |
+| `DERIBIT_TEST_API_KEY` | — | Testnet API key (required if using authenticated endpoints) |
+| `DERIBIT_TEST_API_SECRET` | — | Testnet API secret |
+| `DERIBIT_API_KEY` | — | Production API key |
+| `DERIBIT_API_SECRET` | — | Production API secret |
+| `CURRENCIES` | `BTC,ETH` | Comma-separated list of underlying currencies to monitor |
+| `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`) |
+
+**Warning:** setting `TESTNET=false` connects to `deribit.com` with real funds and prints a large warning to stderr. This requires `DERIBIT_API_KEY` and `DERIBIT_API_SECRET` to be set.
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `aiohttp` | ≥ 3.9 | Async HTTP client and WebSocket transport for Deribit connectors |
+| `orjson` | ≥ 3.9 | Fast JSON serialisation / deserialisation of exchange messages |
+| `python-dotenv` | ≥ 1.0 | Load `config/.env` into environment at startup |
+| `numpy` | ≥ 1.24 | Numerical arrays, spline evaluation, integral approximation |
+| `scipy` | ≥ 1.11 | `CubicSpline` for IV surface fitting; `norm` for Black-Scholes |
+| `pandas` | ≥ 2.0 | Historical return series for physical distribution calibration |
+
+## Entry Point
+
+`main.py` is a research script. It fetches the full option chain for each configured currency, builds the IV surface per expiry, and logs the extracted risk-neutral distribution (mean, skewness, kurtosis, validity). No orders are sent.
+
+The quoting loop and live strategy execution live in `core/strategies/` (private submodule) and are invoked from a separate entry point not included in this public repository.
+
+## Mathematical Specification
+
+See `core/MODEL.md` in the private submodule for the full mathematical specification covering:
+
+- Breeden-Litzenberger RND extraction: f^Q(K) = e^(rT) · d²C/dK²
+- IV surface parameterisation (log-moneyness normalisation, cubic spline)
+- Physical distribution estimation (log-normal, EWMA volatility)
+- Signal construction (KL divergence, Wasserstein-1 distance)
+- Delta-neutral trade construction and Greek risk aggregation
+
+## Risk Defaults
+
+All position limits default to conservative values and apply before any order is generated:
+
+| Limit | Default |
+|---|---|
+| Max gross vega (USD) | 10,000 |
+| Max net delta (USD) | 50,000 |
+| Max gross gamma (USD) | 5,000 |
+| Max notional (USD) | 500,000 |
+| Delta hedge tolerance | 2% of notional |
+
+Override by instantiating `RiskLimits` directly or using `RiskLimits.conservative()`.
