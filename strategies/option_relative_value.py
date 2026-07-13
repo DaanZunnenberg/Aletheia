@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from data.market_state import MarketState
-from signals.distribution_arbitrage import DistributionSignal, Direction
+from core.signals.distribution_arbitrage import DistributionSignal, Direction
 from risk.limits import RiskLimits
 from risk.greeks import GreekExposure
 

@@ -19,12 +19,10 @@ dependencies = [
 where = ["."]
 include = [
     "config*",
+    "core*",
     "data*",
     "deribit*",
     "exchange*",
-    "options*",
-    "models*",
-    "signals*",
     "strategies*",
     "risk*",
     "execution*",

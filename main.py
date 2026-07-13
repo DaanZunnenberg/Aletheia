@@ -1,16 +1,8 @@
 """
 Aletheia — option implied distribution arbitrage framework.
 
-Entry point for live data fetch and snapshot inspection.
-
-Usage
------
-    python main.py                     # BTC and ETH, testnet
-    DRY_RUN=false python main.py       # production data feed
-
-The script fetches a full option chain snapshot for each configured currency,
-builds a MarketState, constructs the IV surface, extracts the risk-neutral
-distribution for the nearest two expiries, and prints a summary.
+Research entry point: fetch a full Deribit option chain, build the IV surface,
+extract the risk-neutral distribution per expiry, and print a summary.
 """
 from __future__ import annotations
 
@@ -21,8 +13,8 @@ from deribit.rest import DeribitREST
 from deribit.types import Ticker
 from data.market_state import FutureQuote, OptionQuote
 from data.normalization import build_market_state, ticker_to_future_quote, ticker_to_option_quote
-from options.surface import build_surface
-from options.risk_neutral_distribution import extract_risk_neutral_distribution
+from core.options.surface import build_surface
+from core.options.risk_neutral_distribution import extract_risk_neutral_distribution
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -89,12 +81,8 @@ async def main() -> None:
                     rnd = extract_risk_neutral_distribution(sl)
                     log.info(
                         "  expiry=%d T=%.3fy  valid=%s  mean=%.2f  skew=%.3f  kurt=%.3f",
-                        sl.expiry_ts,
-                        sl.T,
-                        rnd.is_valid,
-                        rnd.mean,
-                        rnd.skewness,
-                        rnd.kurtosis,
+                        sl.expiry_ts, sl.T, rnd.is_valid,
+                        rnd.mean, rnd.skewness, rnd.kurtosis,
                     )
                 except Exception as exc:
                     log.warning("  RND extraction failed for expiry %d: %s", sl.expiry_ts, exc)
