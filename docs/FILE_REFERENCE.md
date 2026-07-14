@@ -40,7 +40,7 @@ aletheia/                       ← public repo
 ├── config/                     ← settings, secrets
 ├── utils/                      ← shared utilities (logger)
 ├── checks/                     ← connectivity diagnostics
-├── examples/                   ← runnable data feed examples
+├── examples/                   ← runnable Deribit WebSocket streaming examples
 ├── docs/                       ← this file
 └── main.py                     ← research entry point
 ```
@@ -187,6 +187,25 @@ Connectivity diagnostics. Run manually to verify credentials and feeds.
 | `checks/auth.py` | Verify Deribit API key |
 | `checks/rest.py` | Smoke-test REST endpoints |
 | `checks/ws.py` | Smoke-test WebSocket streams |
+
+---
+
+## examples/ (public)
+
+Runnable WebSocket streaming examples against live Deribit data. No production code;
+demonstrates `deribit/connector.py` usage. Not order-book/microstructure tooling —
+this strategy trades on minutes-to-days horizons off mark IV, mark price, index, and
+DVOL, not L2 depth.
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `examples/stream_index.py` | Streams spot index price and DVOL (30d forward IV) for BTC or ETH | active |
+| `examples/stream_options.py` | Streams the full options chain mark prices/IV via `markprice.options.{index}`, renders a calls/puts table around ATM | active |
+
+*Removed: `examples/print_orderbook.py` — depended on `data/orderbook.py`, which was
+deleted in the market-making → distribution-arbitrage restructure (`11faa8e`). L2 order
+book depth is not part of this strategy's data requirements; execution-cost modelling
+(when `execution/` is built out) only needs top-of-book.*
 
 ---
 
