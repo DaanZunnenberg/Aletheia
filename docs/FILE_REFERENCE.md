@@ -12,7 +12,8 @@ Status: `active` | `stub` | `placeholder` (intentionally empty, documents future
 | Layer | Visibility | Contents |
 |-------|-----------|----------|
 | `core/` | **Private** (submodule) | Market state domain model, options analytics, distribution models, signal generation, strategy, risk management |
-| Everything else | **Public** | Exchange connectors, data fetching, normalization, config, utilities, research notebooks, future backtesting framework |
+| `research/` | **Private** (submodule) | Research notebooks, ideas, and validation scripts |
+| Everything else | **Public** | Exchange connectors, data fetching, normalization, config, utilities, future backtesting framework |
 
 The public repo contains zero model or strategy logic. `core/` contains zero connector or I/O code.
 
@@ -35,8 +36,7 @@ aletheia/                       ← public repo
 ├── data/
 │   └── normalization.py        ← raw Deribit types → core domain types
 ├── execution/                  ← order routing (placeholder)
-├── research/
-│   └── notebooks/              ← Jupyter notebooks for exploratory work
+├── research/                   ← private submodule (aletheia-research)
 ├── config/                     ← settings, secrets
 ├── utils/                      ← shared utilities (logger)
 ├── checks/                     ← connectivity diagnostics
@@ -148,15 +148,11 @@ Order routing. Not yet implemented. Will remain public (infrastructure).
 
 ---
 
-## research/ (public)
+## research/ (private submodule — aletheia-research)
 
-Jupyter notebooks for exploratory research. No production code lives here.
+Research notebooks, ideas, and validation scripts. Not part of the public repository history; contents are not documented here. See the submodule's own README for its internal reference.
 
-| Path | Purpose |
-|------|---------|
-| `research/notebooks/` | Surface inspection, RND extraction, signal backtesting |
-
-*Future: a backtesting framework (e.g. vectorbt, backtesting.py, or custom) will be integrated here and remain public.*
+*Future: a backtesting framework (e.g. vectorbt, backtesting.py, or custom) will be integrated in the public repo and remain public — it is infrastructure, not edge.*
 
 ---
 

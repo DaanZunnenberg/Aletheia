@@ -1,3 +1,6 @@
 [submodule "core"]
 	path = core
 	url = https://github.com/DaanZunnenberg/aletheia-core.git
+[submodule "research"]
+	path = research
+	url = https://github.com/DaanZunnenberg/aletheia-research.git
