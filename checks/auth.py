@@ -1,9 +1,6 @@
 """
-Verify that the configured API keys authenticate successfully and can reach
+Application: Verify that the configured API keys authenticate successfully and can reach
 a private Deribit endpoint.
-
-Usage:
-    python3 -m checks.auth
 """
 
 import asyncio
