@@ -13,7 +13,7 @@ def ticker_to_option_quote(ticker: Ticker, instrument: Instrument) -> OptionQuot
         strike=instrument["strike"],
         option_type=instrument["option_type"],
         mark_price=ticker["mark_price"],
-        mark_iv=(ticker["mark_iv"] or 0.0) / 100.0,   # Deribit sends %; store as fraction
+        mark_iv=(ticker["mark_iv"] or 0.0) / 100.0,   # Convert Deribit percentage format to fraction.
         bid_price=ticker["best_bid_price"],
         ask_price=ticker["best_ask_price"],
         bid_iv=(ticker["bid_iv"] / 100.0) if ticker["bid_iv"] is not None else None,
