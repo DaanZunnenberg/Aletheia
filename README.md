@@ -1,8 +1,11 @@
 # Aletheia
 
-An options arbitrage research and trading framework targeting Deribit BTC and ETH options.
+A market-making framework for Deribit BTC/ETH perpetuals.
 
-The core idea: identify and exploit systematic mispricings in Deribit option prices using quantitative models and delta-neutral positions.
+The core idea: quote both sides continuously, capture the spread, and manage
+the resulting inventory risk with an Avellaneda-Stoikov quoting model —
+skewing the reservation price against inventory and widening the spread when
+either volatility or adverse selection risk rises.
 
 ## Architecture
 
@@ -11,31 +14,34 @@ deribit/          — async WebSocket + REST connectors (native aiohttp)
 data/             — market state normalisation (Deribit → internal types)
 config/           — settings and secrets (dry_run, testnet, API keys)
 utils/            — dependency-free helpers (logger)
-core/             — private submodule: model logic, strategies, risk
-main.py           — research entry point
+core/             — private submodule: the model itself
+main.py           — test entry point
 ```
 
-`core/` is a private git submodule ([aletheia-core](https://github.com/DaanZunnenberg/aletheia-core)) and is not included in this public repository. It contains:
+`core/` is a private git submodule ([aletheia-core](https://github.com/DaanZunnenberg/aletheia-core))
+and is not included in this public repository. It contains:
 
-- `core/market_state.py` — `OptionQuote`, `FutureQuote`, `MarketState` domain model
-- `core/options/surface.py` — IV surface construction (log-moneyness, cubic spline per expiry)
-- `core/options/risk_neutral_distribution.py` — implied distribution extraction from option prices
-- `core/models/physical_distribution.py` — statistical distribution models from realised data
-- `core/signals/` — signal generation from distribution and pricing analysis
-- `core/strategies/option_relative_value.py` — delta-neutral trade decisions
-- `core/risk/` — Greek exposure aggregation and hard position limits
-- `core/_math.py` — shared CDF, moment, and tail probability utilities
+- `core/market_state.py` — `MarketState` domain model (top-of-book, mark/index price, funding)
+- `core/models/quoting.py` — Avellaneda-Stoikov reservation price, optimal spread, fill-intensity calibration
+- `core/models/volatility.py` — realised volatility estimator (EWMA of squared log returns)
+- `core/signals/microstructure.py` — order book imbalance, trade imbalance
+- `core/risk/exposure.py` — position tracking, realized/unrealized P&L, funding accrual
+- `core/risk/limits.py` — hard position/order/notional/loss limits
+- `core/strategies/market_maker.py` — assembles the above into a risk-checked `QuoteDecision`
+
+Everything outside `core/` is infrastructure for exercising the model, not the
+strategy itself: fetching a snapshot, normalising it, and running one quoting
+decision through it. There is no live order-placement loop yet.
 
 ## Data Flow
 
 ```
-Deribit REST → fetch option chain + futures curve + spot index
-             → normalise to MarketState
-             → build IV surface (cubic spline per expiry)
-             → extract implied distribution from option prices
-             → generate signals from pricing and distribution analysis
-             → generate delta-neutral trade decisions
-             → enforce risk limits → emit orders (dry-run by default)
+Deribit REST/WS → ticker + order book for the perpetual
+                → normalise to MarketState
+                → estimate realised vol
+                → Avellaneda-Stoikov reservation price + spread
+                → risk-check against position limits
+                → emit a QuoteDecision (dry-run by default; no order routing yet)
 ```
 
 ## Setup
@@ -60,7 +66,7 @@ python main.py
 | `DERIBIT_TEST_API_SECRET` | — | Testnet API secret |
 | `DERIBIT_API_KEY` | — | Production API key |
 | `DERIBIT_API_SECRET` | — | Production API secret |
-| `CURRENCIES` | `BTC,ETH` | Comma-separated list of underlying currencies to monitor |
+| `CURRENCIES` | `BTC,ETH` | Comma-separated list of underlyings whose perpetual to quote |
 | `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`) |
 
 **Warning:** setting `TESTNET=false` connects to `deribit.com` with real funds and prints a large warning to stderr. This requires `DERIBIT_API_KEY` and `DERIBIT_API_SECRET` to be set.
@@ -72,15 +78,15 @@ python main.py
 | `aiohttp` | ≥ 3.9 | Async HTTP client and WebSocket transport for Deribit connectors |
 | `orjson` | ≥ 3.9 | Fast JSON serialisation / deserialisation of exchange messages |
 | `python-dotenv` | ≥ 1.0 | Load `config/.env` into environment at startup |
-| `numpy` | ≥ 1.24 | Numerical arrays, spline evaluation, integral approximation |
-| `scipy` | ≥ 1.11 | `CubicSpline` for IV surface fitting; `norm` for Black-Scholes |
-| `pandas` | ≥ 2.0 | Historical return series for physical distribution calibration |
+| `numpy` | ≥ 1.24 | Numerical arrays, EWMA vol, kappa calibration |
+| `pandas` | ≥ 2.0 | Trade tape handling for fill-intensity calibration and imbalance signals |
 
 ## Entry Point
 
-`main.py` is a research script. It fetches the full option chain for each configured currency, builds the IV surface per expiry, and logs the extracted risk-neutral distribution (mean, skewness, kurtosis, validity). No orders are sent.
-
-The quoting loop and live strategy execution live in `core/strategies/` (private submodule) and are invoked from a separate entry point not included in this public repository.
+`main.py` fetches the current perpetual ticker + order book for each
+configured currency, builds a `MarketState`, and logs a single quoting
+decision (bid/ask price, size, and any risk-limit breaches). No orders are
+sent — order routing is not yet implemented (`execution/` is a placeholder).
 
 ## Mathematical Specification
 
@@ -88,14 +94,13 @@ See `core/MODEL.md` in the private submodule for the full mathematical specifica
 
 ## Risk Defaults
 
-All position limits default to conservative values and apply before any order is generated:
+`RiskLimits.conservative()`:
 
 | Limit | Default |
 |---|---|
-| Max gross vega (USD) | 10,000 |
-| Max net delta (USD) | 50,000 |
-| Max gross gamma (USD) | 5,000 |
-| Max notional (USD) | 500,000 |
-| Delta hedge tolerance | 2% of notional |
+| Max net position (contracts) | 0.25 |
+| Max order size (contracts) | 0.025 |
+| Max gross notional (USD) | 10,000 |
+| Max daily loss (USD) | 500 |
 
-Override by instantiating `RiskLimits` directly or using `RiskLimits.conservative()`.
+Override by instantiating `RiskLimits` directly.

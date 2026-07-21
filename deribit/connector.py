@@ -7,8 +7,7 @@ import aiohttp
 import orjson
 
 from .types import (
-    FundingRate, IndexPrice, OptionMarkPrice, OrderBookSnapshot,
-    Ticker, Trade, VolatilityIndex,
+    FundingRate, IndexPrice, OrderBookSnapshot, Ticker, Trade,
 )
 from utils.logger import get_logger
 
@@ -72,13 +71,11 @@ class DeribitConnector:
 
     Supported streams
     -----------------
-    watch_order_book       — L2 book with incremental updates (futures & options)
-    watch_trades           — public trade tape
-    watch_ticker           — full ticker incl. greeks and IV for options
-    watch_index            — spot index price (btc_usd, eth_usd, …)
-    watch_volatility_index — DVOL index (btc_dvol, eth_dvol)
-    watch_mark_prices      — mark prices + IV for ALL options on an index at once
-    watch_funding          — perpetual funding rate
+    watch_order_book — L2 book with incremental updates
+    watch_trades     — public trade tape
+    watch_ticker     — full ticker
+    watch_index      — spot index price (btc_usd, eth_usd, …)
+    watch_funding    — perpetual funding rate
     """
 
     def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = False) -> None:
@@ -215,12 +212,11 @@ class DeribitConnector:
                         direction=t["direction"],
                         timestamp=float(t["timestamp"]),
                         trade_id=t["trade_id"],
-                        iv=float(t["iv"]) if t.get("iv") is not None else None,
                         index_price=float(t.get("index_price") or 0.0),
                     )
 
     # ------------------------------------------------------------------
-    # Ticker (futures + options; options include greeks and IV)
+    # Ticker
     # ------------------------------------------------------------------
 
     async def watch_ticker(self, instrument: str) -> AsyncIterator[Ticker]:
@@ -238,16 +234,6 @@ class DeribitConnector:
                     best_ask_amount=float(t.get("best_ask_amount") or 0.0),
                     last_price=float(t["last_price"]) if t.get("last_price") is not None else None,
                     open_interest=float(t.get("open_interest") or 0.0),
-                    mark_iv=float(t["mark_iv"]) if t.get("mark_iv") is not None else None,
-                    bid_iv=float(t["bid_iv"]) if t.get("bid_iv") is not None else None,
-                    ask_iv=float(t["ask_iv"]) if t.get("ask_iv") is not None else None,
-                    delta=float(t["delta"]) if t.get("delta") is not None else None,
-                    gamma=float(t["gamma"]) if t.get("gamma") is not None else None,
-                    vega=float(t["vega"]) if t.get("vega") is not None else None,
-                    theta=float(t["theta"]) if t.get("theta") is not None else None,
-                    rho=float(t["rho"]) if t.get("rho") is not None else None,
-                    underlying_index=t.get("underlying_index"),
-                    underlying_price=float(t["underlying_price"]) if t.get("underlying_price") is not None else None,
                     current_funding=float(t["current_funding"]) if t.get("current_funding") is not None else None,
                     funding_8h=float(t["funding_8h"]) if t.get("funding_8h") is not None else None,
                 )
@@ -265,42 +251,6 @@ class DeribitConnector:
                     price=float(data["price"]),
                     timestamp=float(data["timestamp"]),
                 )
-
-    # ------------------------------------------------------------------
-    # Deribit Volatility Index — DVOL  (e.g. 'btc_dvol', 'eth_dvol')
-    # ------------------------------------------------------------------
-
-    async def watch_volatility_index(self, index_name: str) -> AsyncIterator[VolatilityIndex]:
-        # Deribit uses the price index name as the channel param (btc_usd, eth_usd),
-        # not a dedicated dvol name (btc_dvol does not work).
-        channel = f"deribit_volatility_index.{index_name}"
-        async with aiohttp.ClientSession() as session:
-            async for _, data in _sub_stream(session, self._url, [channel]):
-                yield VolatilityIndex(
-                    index_name=data["index_name"],
-                    timestamp=float(data["timestamp"]),
-                    volatility=float(data["volatility"]),
-                )
-
-    # ------------------------------------------------------------------
-    # All-options mark prices  (e.g. index_name='btc_usd', 'eth_usd')
-    # ------------------------------------------------------------------
-
-    async def watch_mark_prices(self, index_name: str) -> AsyncIterator[list[OptionMarkPrice]]:
-        # markprice.options is a differential channel: each message contains only
-        # the options whose mark price changed since the last message, not the full
-        # chain. Merge into a cache so every yield returns the complete option set.
-        channel = f"markprice.options.{index_name}"
-        cache: dict[str, OptionMarkPrice] = {}
-        async with aiohttp.ClientSession() as session:
-            async for _, data in _sub_stream(session, self._url, [channel]):
-                for entry in data:
-                    cache[entry["instrument_name"]] = OptionMarkPrice(
-                        instrument_name=entry["instrument_name"],
-                        mark_price=float(entry["mark_price"]),
-                        mark_iv=float(entry["iv"]),
-                    )
-                yield list(cache.values())
 
     # ------------------------------------------------------------------
     # Perpetual funding rate

@@ -4,11 +4,9 @@ from .types import (
     FundingRate,
     IndexPrice,
     Instrument,
-    OptionMarkPrice,
     OrderBookSnapshot,
     Ticker,
     Trade,
-    VolatilityIndex,
 )
 
 __all__ = [
@@ -17,9 +15,7 @@ __all__ = [
     "FundingRate",
     "IndexPrice",
     "Instrument",
-    "OptionMarkPrice",
     "OrderBookSnapshot",
     "Ticker",
     "Trade",
-    "VolatilityIndex",
 ]

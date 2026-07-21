@@ -1,8 +1,10 @@
 """
-Aletheia — options arbitrage research framework.
+Aletheia — perpetual market-making framework.
 
-Research entry point: fetch a full Deribit option chain, build the IV surface,
-extract implied distributions per expiry, and print a summary.
+Test entry point: fetch the current BTC/ETH perpetual order book + ticker,
+build a MarketState, and print a single quoting decision from the
+Avellaneda-Stoikov model. This is infrastructure for exercising the model in
+core/, not a live trading loop — order placement is not implemented.
 """
 from __future__ import annotations
 
@@ -10,80 +12,42 @@ import asyncio
 
 from config.settings import Settings
 from deribit.rest import DeribitREST
-from deribit.types import Instrument, Ticker
-from core.market_state import FutureQuote, OptionQuote
-from data.normalization import build_market_state, ticker_to_future_quote, ticker_to_option_quote
-from core.options.surface import build_surface
-from core.options.risk_neutral_distribution import extract_risk_neutral_distribution
+from data.normalization import build_market_state
+from core.models.quoting import QuotingParams
+from core.risk.exposure import Position
+from core.risk.limits import RiskLimits
+from core.strategies.market_maker import generate_quotes
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# Deribit public endpoints: 20 req/s unauthenticated, higher with auth.
-# Keep below the limit with a semaphore so the loop never gets rate-limited.
-_TICKER_CONCURRENCY = 20
+# Fixed until a proper vol estimator is wired up from a rolling mid-price history
+# (core/models/volatility.py needs a sampled series; a single snapshot has none).
+_PLACEHOLDER_SIGMA = 0.6
 
 
-async def _fetch_option_ticker(
-    rest: DeribitREST,
-    sem: asyncio.Semaphore,
-    inst: Instrument,
-) -> OptionQuote | None:
-    async with sem:
-        try:
-            ticker: Ticker = await rest.get_ticker(inst["instrument_name"])
-            if ticker["mark_iv"] and ticker["mark_iv"] > 0:
-                return ticker_to_option_quote(ticker, inst)
-        except Exception as exc:
-            log.warning("Ticker fetch failed for %s: %s", inst["instrument_name"], exc)
-    return None
-
-
-async def _fetch_future_ticker(
-    rest: DeribitREST,
-    sem: asyncio.Semaphore,
-    inst: Instrument,
-) -> FutureQuote | None:
-    async with sem:
-        try:
-            ticker = await rest.get_ticker(inst["instrument_name"])
-            return ticker_to_future_quote(ticker, inst)
-        except Exception as exc:
-            log.warning("Ticker fetch failed for %s: %s", inst["instrument_name"], exc)
-    return None
-
-
-async def fetch_market_state(rest: DeribitREST, currency: str):
-    log.info("Fetching %s instruments…", currency)
-
-    opt_instruments, fut_instruments, index = await asyncio.gather(
-        rest.get_instruments(currency, "option"),
-        rest.get_instruments(currency, "future"),
-        rest.get_index_price(f"{currency.lower()}_usd"),
+async def quote_perpetual(rest: DeribitREST, currency: str) -> None:
+    instrument_name = f"{currency}-PERPETUAL"
+    ticker, book = await asyncio.gather(
+        rest.get_ticker(instrument_name),
+        rest.get_order_book(instrument_name),
     )
-    spot = index["price"]
+    state = build_market_state(ticker, book)
 
-    sem = asyncio.Semaphore(_TICKER_CONCURRENCY)
+    params = QuotingParams(gamma=0.1, time_horizon=1.0 / 365.0, kappa=1.5, A=140.0)
+    limits = RiskLimits.conservative()
+    position = Position()
 
-    active_opts = [i for i in opt_instruments if i["is_active"]]
-    active_futs = [i for i in fut_instruments if i["is_active"]]
-
-    opt_results, fut_results = await asyncio.gather(
-        asyncio.gather(*[_fetch_option_ticker(rest, sem, i) for i in active_opts]),
-        asyncio.gather(*[_fetch_future_ticker(rest, sem, i) for i in active_futs]),
-    )
-
-    option_quotes = [r for r in opt_results if r is not None]
-    future_quotes = [r for r in fut_results if r is not None]
+    decision = generate_quotes(state, position, _PLACEHOLDER_SIGMA, params, limits)
 
     log.info(
-        "%s: fetched %d/%d option tickers, %d/%d future tickers",
-        currency,
-        len(option_quotes), len(active_opts),
-        len(future_quotes), len(active_futs),
+        "%s  mid=%.2f  bid=%.2f (size=%.4f, skip=%s)  ask=%.2f (size=%.4f, skip=%s)",
+        instrument_name, state.mid_price,
+        decision.bid_price, decision.bid_size, decision.skip_bid,
+        decision.ask_price, decision.ask_size, decision.skip_ask,
     )
-
-    return build_market_state(currency, spot, option_quotes, future_quotes)
+    if decision.breaches:
+        log.warning("  risk breaches: %s", "; ".join(decision.breaches))
 
 
 async def main() -> None:
@@ -93,32 +57,9 @@ async def main() -> None:
         api_secret=settings.api_secret,
         testnet=settings.testnet,
     )
-
     try:
         for currency in settings.currencies:
-            state = await fetch_market_state(rest, currency)
-            log.info(
-                "%s: spot=%.2f  options=%d  futures=%d  expiries=%d",
-                currency,
-                state.spot_price,
-                len(state.option_chain),
-                len(state.futures_curve),
-                len(state.expiries()),
-            )
-
-            surface = build_surface(state)
-            log.info("%s IV surface: %d slices", currency, len(surface.slices))
-
-            for sl in surface.slices:
-                try:
-                    rnd = extract_risk_neutral_distribution(sl)
-                    log.info(
-                        "  expiry=%d T=%.3fy  valid=%s  mean=%.2f  skew=%.3f  kurt=%.3f",
-                        sl.expiry_ts, sl.T, rnd.is_valid,
-                        rnd.mean, rnd.skewness, rnd.kurtosis,
-                    )
-                except Exception as exc:
-                    log.warning("  RND extraction failed for expiry %d: %s", sl.expiry_ts, exc)
+            await quote_perpetual(rest, currency)
     finally:
         await rest.close()
 
