@@ -3,7 +3,7 @@
 A market-making framework for Deribit BTC/ETH perpetuals.
 
 The core idea: quote both sides continuously, capture the spread, and manage
-the resulting inventory risk with an Avellaneda-Stoikov quoting model —
+the resulting inventory risk with an Avellaneda--Stoikov quoting model,
 skewing the reservation price against inventory and widening the spread when
 either volatility or adverse selection risk rises.
 
