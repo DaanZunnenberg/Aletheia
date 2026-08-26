@@ -33,6 +33,12 @@ config/.env
 .DS_Store
 Thumbs.db
 
+# Jupyter / test caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Runtime outputs (keep the directory, ignore contents)
 runtime/*
 !runtime/.gitkeep
