@@ -1,6 +1,6 @@
 # Aletheia
 
-A market-making framework for Deribit BTC/ETH perpetuals.
+A market-making framework for Deribit perpetuals.
 
 The core idea: quote both sides continuously, capture the spread, and manage
 the resulting inventory risk with an Avellaneda--Stoikov quoting model,
