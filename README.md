@@ -104,3 +104,7 @@ See `core/MODEL.md` in the private submodule for the full mathematical specifica
 | Max daily loss (USD) | 500 |
 
 Override by instantiating `RiskLimits` directly.
+
+---
+
+_Last reviewed: 2026-08-31._
