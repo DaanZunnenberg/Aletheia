@@ -22,7 +22,7 @@ main.py           — test entry point
 and is not included in this public repository. It contains:
 
 - `core/market_state.py` — `MarketState` domain model (top-of-book, mark/index price, funding)
-- `core/models/quoting.py` — Avellaneda-Stoikov reservation price, optimal spread, fill-intensity calibration
+- `core/models/quoting.py` — AS reservation price, optimal spread, fill-intensity calibration
 - `core/models/volatility.py` — realised volatility estimator (EWMA of squared log returns)
 - `core/signals/microstructure.py` — order book imbalance, trade imbalance
 - `core/risk/exposure.py` — position tracking, realized/unrealized P&L, funding accrual
