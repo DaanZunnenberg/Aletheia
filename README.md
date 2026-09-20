@@ -5,13 +5,6 @@ BTC/ETH perpetuals, managing inventory risk with closed-form quoting models
 (Avellaneda-Stoikov, GLFT) and regime/toxicity-aware gating, backtested
 against real exchange data.
 
-This repo is at a rebuild point: the public data/streaming layer was reset
-to a clean slate on 2026-09-18 (a full pre-reset snapshot, including the
-private submodules' contents at that point, is archived at
-[AletheiaMM](https://github.com/DaanZunnenberg/AletheiaMM)). The model,
-strategy, and risk logic live in two private submodules and were not
-touched by the reset.
-
 ## Layout
 
 ```
