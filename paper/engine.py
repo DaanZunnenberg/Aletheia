@@ -12,6 +12,7 @@ from core.models.volatility import ewma_volatility
 from core.risk.limits import RiskLimits
 from core.strategies.market_maker import QuoteDecision, generate_quotes
 from data.orderbook import OrderBookUpdate
+from paper.bar_builder import LiveBarAggregator
 from paper.dashboard import InstrumentSnapshot
 from paper.fill_simulator import check_fill
 from paper.option_quoting import generate_option_quote
@@ -79,16 +80,26 @@ class PaperTradingEngine:
         self.latest_books: dict[tuple[str, str, str], OrderBookUpdate] = {}
         self.resting_quotes: dict[tuple[str, str, str], QuoteDecision] = {}
         self.position_book = PositionBook()
-        self.mid_history: dict[str, list[float]] = {q.underlying_ccy: [] for q in quoted_perps}
+        # Fixed-interval bars, not raw ticks: ewma_volatility() assumes evenly-
+        # spaced samples (it scales annualisation by a fixed sampling_seconds),
+        # but live book updates arrive irregularly. Feeding raw ticks in
+        # silently distorts the vol estimate -- see paper/bar_builder.py.
+        self._bar_seconds = 1.0
+        self.bars: dict[str, LiveBarAggregator] = {
+            q.underlying_ccy: LiveBarAggregator(self._bar_seconds) for q in quoted_perps
+        }
         self.start_time = time.time()
         self.n_fills = 0
 
     def _sigma_for(self, currency: str) -> float | None:
-        history = self.mid_history.get(currency, [])
-        if len(history) < _VOL_WARMUP_UPDATES:
+        aggregator = self.bars.get(currency)
+        if aggregator is None:
             return None
-        window = pd.Series(history[-_VOL_WARMUP_UPDATES * 5:])
-        return ewma_volatility(window, _VOL_HALFLIFE_SECONDS, sampling_seconds=1.0)
+        closes = aggregator.closed_series()
+        if len(closes) < _VOL_WARMUP_UPDATES:
+            return None
+        window = pd.Series(closes[-_VOL_WARMUP_UPDATES * 5:])
+        return ewma_volatility(window, _VOL_HALFLIFE_SECONDS, sampling_seconds=self._bar_seconds)
 
     def on_book_update(self, update: OrderBookUpdate) -> None:
         self.latest_books[update.key] = update
@@ -111,7 +122,9 @@ class PaperTradingEngine:
         if spec.key in self.resting_quotes:
             self._apply_fills(spec.key, self.resting_quotes[spec.key], update)
 
-        self.mid_history.setdefault(spec.underlying_ccy, []).append(update.mid_price)
+        self.bars.setdefault(spec.underlying_ccy, LiveBarAggregator(self._bar_seconds)).update(
+            update.timestamp / 1000.0, update.mid_price
+        )
         sigma = self._sigma_for(spec.underlying_ccy)
         if sigma is None:
             return
@@ -125,7 +138,9 @@ class PaperTradingEngine:
             current_funding=None, timestamp=update.timestamp,
         )
         position = self.position_book.position_for(_instrument_id(spec.key))
-        self.resting_quotes[spec.key] = generate_quotes(state, position, sigma, _PERP_PARAMS, _PERP_LIMITS)
+        self.resting_quotes[spec.key] = generate_quotes(
+            state, position, sigma, _PERP_PARAMS, _PERP_LIMITS, reference_price=update.microprice
+        )
 
     def _handle_option_update(self, update: OrderBookUpdate) -> None:
         spec = self._quoted_options[update.key]
@@ -141,7 +156,7 @@ class PaperTradingEngine:
             (spec.expiration_timestamp_ms - update.timestamp) / 1000.0 / _SECONDS_PER_YEAR, 0.0
         )
         self.resting_quotes[spec.key] = generate_option_quote(
-            underlying_price=underlying_book.mid_price,
+            underlying_price=underlying_book.microprice,
             time_to_expiry_years=time_to_expiry,
             realized_vol=sigma,
             strike=spec.strike,

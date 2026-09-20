@@ -35,6 +35,33 @@ def test_empty_book_sides_yield_nan_not_a_crash():
     assert math.isnan(u.mid_price)
 
 
+def test_microprice_equals_mid_when_sizes_are_symmetric():
+    u = _update(bids=((100.0, 5.0),), asks=((101.0, 5.0),))
+    assert u.microprice == u.mid_price
+
+
+def test_microprice_leans_toward_the_thinner_side():
+    """More size resting on the bid -> microprice pulled toward the ask
+    (the bid side is less likely to be the one consumed next)."""
+    u = _update(bids=((100.0, 9.0),), asks=((101.0, 1.0),))
+    assert u.microprice > u.mid_price
+
+
+def test_microprice_leans_toward_the_thinner_ask_side_symmetric_case():
+    u = _update(bids=((100.0, 1.0),), asks=((101.0, 9.0),))
+    assert u.microprice < u.mid_price
+
+
+def test_microprice_falls_back_to_mid_on_empty_book():
+    u = _update(bids=(), asks=())
+    assert math.isnan(u.microprice)
+
+
+def test_microprice_falls_back_to_mid_on_zero_total_size():
+    u = _update(bids=((100.0, 0.0),), asks=((101.0, 0.0),))
+    assert u.microprice == u.mid_price
+
+
 def test_is_frozen():
     u = _update()
     try:
