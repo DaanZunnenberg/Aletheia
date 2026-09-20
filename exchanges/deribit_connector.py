@@ -30,13 +30,20 @@ class DeribitOrderBookConnector:
     instrument's book, which is cleared and rebuilt from the next snapshot
     rather than silently drifting out of sync with the real book.
 
-    market_type is fixed to "perpetual": this project only needs Deribit's
-    perpetual futures books (no options order-book streaming here).
+    Deribit's book.* channel is generic across instrument kinds -- the same
+    subscription mechanics work for a perpetual, a dated future, or an
+    option. market_type is a constructor parameter purely for tagging the
+    resulting OrderBookUpdate (data/orderbook.py's MarketType), it doesn't
+    change how this connector talks to Deribit at all. Passing "option"
+    instrument names (e.g. "BTC-26SEP26-80000-C") streams their L2 books
+    exactly the same way; option premiums arrive BTC/ETH-denominated
+    (Deribit's inverse quoting), not USD -- this connector does not convert
+    that, same caveat as core.models.options.black76.
     """
-    market_type = "perpetual"
 
-    def __init__(self, testnet: bool = False) -> None:
+    def __init__(self, testnet: bool = False, market_type: str = "perpetual") -> None:
         self._url = _WS_TEST if testnet else _WS_LIVE
+        self.market_type = market_type
 
     async def stream_order_books(self, symbols: list[str], depth: int = 20) -> AsyncIterator[OrderBookUpdate]:
         channels = [f"book.{s}.100ms" for s in symbols]

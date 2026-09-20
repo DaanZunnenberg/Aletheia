@@ -1,4 +1,3 @@
-from .connector import DeribitConnector
 from .rest import DeribitREST
 from .types import (
     FundingRate,
@@ -10,7 +9,6 @@ from .types import (
 )
 
 __all__ = [
-    "DeribitConnector",
     "DeribitREST",
     "FundingRate",
     "IndexPrice",
