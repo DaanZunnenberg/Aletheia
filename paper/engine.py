@@ -17,7 +17,7 @@ from core.models.greeks_aggregator import (
 )
 from core.models.glft import GLFTParams
 from core.models.ladder import LadderParams, LadderQuoteDecision, generate_ladder_quotes
-from core.models.options.black76 import OptionType, black76_greeks
+from core.models.options.black76 import OptionType, black76_greeks, black76_price
 from core.models.regime_monitor import RegimeState, classify_trend_regime, classify_vol_regime
 from core.models.volatility import ema_drift, ewma_volatility
 from core.risk.limits import RiskLimits
@@ -25,7 +25,7 @@ from core.strategies.market_maker import QuoteDecision
 from data.orderbook import OrderBookUpdate
 from deribit.types import Trade
 from paper.bar_builder import LiveBarAggregator
-from paper.dashboard import InstrumentSnapshot, RiskSnapshot
+from paper.dashboard import BlotterRow, InstrumentSnapshot, RiskSnapshot
 from paper.execution_latency import LatencyModel, is_quote_live
 from paper.execution_latency import taker_slippage_price
 from paper.fill_simulator import PaperFill
@@ -48,6 +48,14 @@ _PERP_GLFT_PARAMS = GLFTParams(gamma=5.0, kappa=1.5, A=0.05, q_max=1.0)
 _PERP_LADDER_PARAMS = LadderParams(n_levels=3, intensity_decay_per_level=0.5, size_decay_per_level=0.6)
 _PERP_LIMITS = RiskLimits()
 _SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
+_OB_DEPTH_LEVELS_SHOWN = 5  # top-of-book depth surfaced to the dashboard, real exchange liquidity (not our own quotes)
+
+# Illustrative Deribit-like fee schedule (bps of notional). Resting-quote
+# fills via the trade-tape/queue tracker are maker (we provided the
+# liquidity that got hit); hard-hedge fills cross the book, so they're
+# taker. Not pulled from a live fee-tier API -- flat, conservative estimate.
+_MAKER_FEE_BPS = 0.0
+_TAKER_FEE_BPS = 5.0
 
 
 def _instrument_id(key: tuple[str, str, str]) -> str:
@@ -58,6 +66,38 @@ def _instrument_id(key: tuple[str, str, str]) -> str:
     one Position the moment both were ever quoted.
     """
     return f"{key[0]}:{key[1]}:{key[2]}"
+
+
+def _blotter_row(timestamp: float, instrument: str, event_type: str, data: dict) -> BlotterRow:
+    """Maps a logged event's raw data dict onto the blotter's fixed column schema."""
+    if event_type == "quote":
+        book_bid, book_ask = data["book_bid"], data["book_ask"]
+        book_bid_size, book_ask_size = data["book_bid_size"], data["book_ask_size"]
+        if "bid_levels" in data:  # ladder (perp)
+            bids, asks = data["bid_levels"], data["ask_levels"]
+            our_bid = bids[0][0] if bids else None
+            our_ask = asks[0][0] if asks else None
+            note = f"{len(bids)}lvl bidsz={bids[0][1]:.4f} asksz={asks[0][1]:.4f}" if bids and asks else "skip"
+        else:
+            our_bid, our_ask = data["bid"], data["ask"]
+            note = f"bidsz={data['bid_size']:.4f} asksz={data['ask_size']:.4f}"
+        return BlotterRow(
+            timestamp, instrument, event_type, book_bid=book_bid, book_ask=book_ask,
+            book_bid_size=book_bid_size, book_ask_size=book_ask_size, our_bid=our_bid, our_ask=our_ask, note=note,
+        )
+    if event_type == "fill":
+        return BlotterRow(
+            timestamp, instrument, event_type, side=data["side"], price=data["price"], size=data["size"],
+            fee=data.get("fee"), slippage=data.get("slippage"), note=f"L{data['level']}",
+        )
+    if event_type == "hedge":
+        side = "buy" if data["hedge_qty"] > 0 else "sell"
+        return BlotterRow(
+            timestamp, instrument, event_type, side=side, price=data["exec_price"], size=abs(data["hedge_qty"]),
+            fee=data.get("fee"), slippage=data.get("slippage"),
+            note=f"delta {data['portfolio_delta_before']:+.4f}->band",
+        )
+    return BlotterRow(timestamp, instrument, event_type, note=str(data))
 
 
 def _size_ahead_at_price(levels: tuple[tuple[float, float], ...], price: float) -> float:
@@ -142,7 +182,7 @@ class PaperTradingEngine:
         self.start_time = time.time()
         self.n_fills = 0
         self.n_hard_hedges = 0
-        self.recent_fills: deque[tuple[float, str, str, float, float]] = deque(maxlen=20)  # (ts, instrument, side, price, size)
+        self.event_log: deque[BlotterRow] = deque(maxlen=500)  # dashboard tape, one fixed-schema row per event
         self.update_event = asyncio.Event()  # set on every book/trade update so the dashboard can render live, not on a timer
 
     def close(self) -> None:
@@ -202,6 +242,11 @@ class PaperTradingEngine:
     def _log(self, timestamp: float, event_type: str, instrument: str, data: dict) -> None:
         if self.session_logger is not None:
             self.session_logger.log(SessionEvent(timestamp=timestamp, event_type=event_type, instrument=instrument, data=data))
+        # greeks/regime are continuously-updated *state*, not discrete order/market
+        # events -- they belong in the dashboard's header (always current), not
+        # repeated on every tick in the tape, or they'd drown out real events.
+        if event_type not in ("greeks", "regime"):
+            self.event_log.append(_blotter_row(timestamp, instrument, event_type, data))
 
     # ------------------------------------------------------------------
     # Book updates: quoting
@@ -235,6 +280,8 @@ class PaperTradingEngine:
             self.queue_tracker.clear_order(instrument, "ask")
         self._log(update.timestamp / 1000.0, "quote", instrument, {
             "bid": quote.bid_price, "ask": quote.ask_price, "bid_size": quote.bid_size, "ask_size": quote.ask_size,
+            "book_bid": update.bids[0][0] if update.bids else None, "book_ask": update.asks[0][0] if update.asks else None,
+            "book_bid_size": update.bids[0][1] if update.bids else None, "book_ask_size": update.asks[0][1] if update.asks else None,
         })
 
     def _register_resting_ladder(self, key: tuple[str, str, str], ladder: LadderQuoteDecision, update: OrderBookUpdate) -> None:
@@ -260,6 +307,8 @@ class PaperTradingEngine:
         self._log(update.timestamp / 1000.0, "quote", instrument, {
             "bid_levels": [(lvl.price, lvl.size) for lvl in ladder.bid_levels],
             "ask_levels": [(lvl.price, lvl.size) for lvl in ladder.ask_levels],
+            "book_bid": update.bids[0][0] if update.bids else None, "book_ask": update.asks[0][0] if update.asks else None,
+            "book_bid_size": update.bids[0][1] if update.bids else None, "book_ask_size": update.asks[0][1] if update.asks else None,
         })
 
     def _handle_perp_update(self, update: OrderBookUpdate) -> None:
@@ -337,9 +386,15 @@ class PaperTradingEngine:
             self.position_book.apply_fill(
                 _instrument_id(key), now_ms / 1000.0, PaperFill(side=side, price=price, size=filled_size),
             )
+            # Maker fill: we were the resting order, filled exactly at our quoted
+            # price -- no execution slippage, just the (typically zero/rebate) maker fee.
+            fee = price * filled_size * _MAKER_FEE_BPS / 1e4
+            if fee != 0.0:
+                self.position_book.position_for(_instrument_id(key)).apply_fee(fee)
             self.n_fills += 1
-            self.recent_fills.append((now_ms / 1000.0, instrument, side, price, filled_size))
-            self._log(now_ms / 1000.0, "fill", instrument, {"side": side, "level": level, "price": price, "size": filled_size})
+            self._log(now_ms / 1000.0, "fill", instrument, {
+                "side": side, "level": level, "price": price, "size": filled_size, "fee": fee, "slippage": 0.0,
+            })
             self.update_event.set()
             log.info("FILL  %-22s %s L%d %.6g @ %.6g (queue/trade-tape)", instrument, side, level, filled_size, price)
 
@@ -438,10 +493,17 @@ class PaperTradingEngine:
         exec_price = taker_slippage_price(perp_book.mid_price, side, abs(hedge_qty), depth)
 
         fill = PaperFill(side="bid" if hedge_qty > 0 else "ask", price=exec_price, size=abs(hedge_qty))
+        position = self.position_book.position_for(_instrument_id(perp_key))
         self.position_book.apply_fill(_instrument_id(perp_key), update.timestamp / 1000.0, fill)
+        # Taker fill: crosses the book, so it pays the taker fee and eats the
+        # slippage taker_slippage_price() already walked into exec_price.
+        fee = exec_price * abs(hedge_qty) * _TAKER_FEE_BPS / 1e4
+        slippage = exec_price - perp_book.mid_price
+        position.apply_fee(fee)
         self.n_hard_hedges += 1
         self._log(update.timestamp / 1000.0, "hedge", perp_book.symbol, {
-            "reason": "hard_delta_band", "portfolio_delta_before": total.delta, "hedge_qty": hedge_qty, "exec_price": exec_price,
+            "reason": "hard_delta_band", "portfolio_delta_before": total.delta, "hedge_qty": hedge_qty,
+            "exec_price": exec_price, "fee": fee, "slippage": slippage,
         })
         log.warning(
             "HARD HEDGE  %s  delta=%.4f breached %.4f -> %s %.4f @ %.4f",
@@ -476,6 +538,20 @@ class PaperTradingEngine:
             position = self.position_book.position_for(instrument_id)
             underlying_ccy = self._quoted_perps.get(key, self._quoted_options.get(key)).underlying_ccy \
                 if key in self._quoted_perps or key in self._quoted_options else None
+
+            realized_vol = fair_vol = theo_price = None
+            if key in self._quoted_options:
+                spec = self._quoted_options[key]
+                sigma = self._sigma_for(spec.underlying_ccy)
+                underlying_book = self.latest_books.get(spec.underlying_key)
+                if sigma is not None and underlying_book is not None:
+                    realized_vol = sigma
+                    fair_vol = sigma * VRP_MULTIPLIER
+                    time_to_expiry = max((spec.expiration_timestamp_ms - update.timestamp) / 1000.0 / _SECONDS_PER_YEAR, 1e-6)
+                    theo_price = black76_price(
+                        underlying_book.microprice, spec.strike, time_to_expiry, fair_vol, spec.option_type,
+                    ) / underlying_book.microprice  # coin-denominated, comparable to `mid`
+
             rows.append(
                 InstrumentSnapshot(
                     instrument=symbol, exchange=exchange, kind=kind, mid=update.mid_price,
@@ -488,6 +564,9 @@ class PaperTradingEngine:
                     best_bid_size=update.bids[0][1] if update.bids else None,
                     best_ask_size=update.asks[0][1] if update.asks else None,
                     sigma=self._sigma_for(underlying_ccy) if underlying_ccy else None,
+                    book_bids=update.bids[:_OB_DEPTH_LEVELS_SHOWN],
+                    book_asks=update.asks[:_OB_DEPTH_LEVELS_SHOWN],
+                    realized_vol=realized_vol, fair_vol=fair_vol, theo_price=theo_price,
                 )
             )
         return rows

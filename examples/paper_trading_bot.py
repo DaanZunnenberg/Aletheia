@@ -123,7 +123,7 @@ async def main(run_seconds: float) -> None:
             engine.snapshot(), elapsed, engine.n_fills,
             n_hard_hedges=engine.n_hard_hedges, portfolio_greeks=engine.portfolio_greeks,
             regimes=engine.regimes, warmup_statuses=engine.warmup_statuses(),
-            recent_fills=list(engine.recent_fills), risk_snapshots=engine.risk_snapshots(),
+            risk_snapshots=engine.risk_snapshots(), event_log=list(engine.event_log),
         )
 
     async def render_loop(live: Live) -> None:

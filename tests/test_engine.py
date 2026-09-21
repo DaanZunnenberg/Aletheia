@@ -211,6 +211,11 @@ def test_hard_hedge_fires_when_position_breaches_the_delta_band():
     engine.on_book_update(_perp_update(81_000.0, t=30.0))  # one more update triggers the hedge check
     assert engine.n_hard_hedges >= 1
 
+    hedge_events = [e for e in engine.event_log if e.event_type == "hedge"]
+    assert hedge_events
+    assert hedge_events[-1].fee is not None and hedge_events[-1].fee > 0.0  # taker fee is a real cost
+    assert hedge_events[-1].slippage is not None
+
 
 def test_hard_hedge_does_not_fire_within_the_band():
     engine = _new_engine(hard_hedge_limits=HardHedgeLimits(max_abs_delta=1.0))
@@ -327,3 +332,64 @@ def test_risk_snapshots_reports_position_against_limits():
     assert snapshot.max_position == 1.0
     assert snapshot.max_gross_notional_usd == 50_000.0
     assert snapshot.max_abs_delta == HardHedgeLimits().max_abs_delta
+
+
+def test_event_log_records_merged_book_and_quote_snapshot():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=1)
+    quote_events = [e for e in engine.event_log if e.event_type == "quote"]
+    assert quote_events
+    row = quote_events[-1]
+    assert row.our_bid is not None and row.our_ask is not None
+    assert row.book_bid is not None and row.book_ask is not None
+    assert row.book_bid_size is not None and row.book_ask_size is not None
+
+
+def test_event_log_records_fill_with_fee_and_slippage():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=1)
+    ladder = engine.resting_ladders[_PERP_KEY]
+    deepest_bid = ladder.bid_levels[-1].price
+    engine.on_trade(_trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=31.0))
+    fill_events = [e for e in engine.event_log if e.event_type == "fill"]
+    assert fill_events
+    row = fill_events[-1]
+    assert row.side == "bid"
+    assert row.price is not None
+    assert row.size is not None
+    assert row.fee is not None
+    assert row.slippage == 0.0  # maker fill: no execution slippage
+
+
+def test_snapshot_includes_order_book_depth():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=0)
+    snap = next(s for s in engine.snapshot() if s.instrument == "BTC-PERPETUAL")
+    assert len(snap.book_bids) >= 1
+    assert len(snap.book_asks) >= 1
+
+
+def test_event_log_excludes_greeks_and_regime_state_updates():
+    engine = _new_engine()
+    rng = np.random.default_rng(0)
+    mid = 81_000.0
+    for i in range(310):
+        mid += rng.normal(0, 1.0)
+        engine.on_book_update(_perp_update(mid, t=float(i)))
+    event_types = {e.event_type for e in engine.event_log}
+    assert "greeks" not in event_types
+    assert "regime" not in event_types
+    assert "BTC" in engine.regimes  # still tracked as state, just not tape rows
+    assert "BTC" in engine.portfolio_greeks
+
+
+def test_snapshot_includes_option_pricing_and_vrp_edge():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=2)
+    engine.on_book_update(_option_update(0.01, 0.011, t=31.0))
+    snap = next(s for s in engine.snapshot() if s.instrument == "BTC-21SEP26-81000-C")
+    assert snap.realized_vol is not None
+    assert snap.fair_vol is not None
+    assert snap.fair_vol > snap.realized_vol  # VRP_MULTIPLIER > 1.0
+    assert snap.theo_price is not None
+    assert snap.theo_price > 0.0

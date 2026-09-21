@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from rich.console import Console
+from rich.table import Table
 
+from core.models.greeks_aggregator import PortfolioGreeks
 from core.models.regime_monitor import RegimeState
 from paper.dashboard import (
+    BlotterRow,
     InstrumentSnapshot,
     MarketDashboard,
     RiskSnapshot,
@@ -23,6 +26,29 @@ def _snap(**overrides) -> InstrumentSnapshot:
     defaults.update(overrides)
     return InstrumentSnapshot(**defaults)
 
+
+def _risk(**overrides) -> RiskSnapshot:
+    defaults = dict(
+        position=0.1, max_position=1.0, gross_notional_usd=1_000.0, max_gross_notional_usd=50_000.0,
+        daily_loss_usd=0.0, max_daily_loss_usd=2_000.0, portfolio_delta=0.05, max_abs_delta=0.5,
+    )
+    defaults.update(overrides)
+    return RiskSnapshot(**defaults)
+
+
+def _row(**overrides) -> BlotterRow:
+    defaults = dict(timestamp=1.0, instrument="BTC-PERPETUAL", event_type="fill")
+    defaults.update(overrides)
+    return BlotterRow(**defaults)
+
+
+def _rendered_text(renderable, width: int = 220) -> str:
+    console = Console(width=width, record=True, force_terminal=True)
+    console.print(renderable)
+    return console.export_text()
+
+
+# -- plain-text fallback renderer (render_dashboard) --------------------------------------
 
 def test_render_includes_every_instrument_name():
     output = render_dashboard([_snap(instrument="BTC-PERPETUAL"), _snap(instrument="ETH-PERPETUAL")], 10.0, 5)
@@ -59,8 +85,6 @@ def test_render_omits_greeks_section_when_not_provided():
 
 
 def test_render_includes_greeks_section_when_provided():
-    from core.models.greeks_aggregator import PortfolioGreeks
-
     output = render_dashboard([_snap()], 1.0, 0, portfolio_greeks={"BTC": PortfolioGreeks(delta=0.5, gamma=0.01)})
     assert "PORTFOLIO GREEKS" in output
     assert "BTC" in output
@@ -71,70 +95,7 @@ def test_render_includes_hard_hedge_count():
     assert "hard hedges: 3" in output
 
 
-def _rendered_text(renderable) -> str:
-    console = Console(width=200, record=True, force_terminal=True)
-    console.print(renderable)
-    return console.export_text()
-
-
-def test_spread_bps_none_when_missing_a_side():
-    assert spread_bps(None, 100.0, 100.0) is None
-    assert spread_bps(99.0, None, 100.0) is None
-
-
-def test_spread_bps_computes_relative_to_mid():
-    assert spread_bps(99.0, 101.0, 100.0) == 200.0
-
-
-def test_market_dashboard_render_includes_instrument_and_ladder_levels():
-    dashboard = MarketDashboard()
-    snap = _snap(bid_levels=((80_999.0, 0.1), (80_995.0, 0.05)), ask_levels=((81_002.0, 0.1), (81_006.0, 0.05)))
-    text = _rendered_text(dashboard.render([snap], 10.0, 5))
-    assert "BTC-PERPETUAL" in text
-    assert "80,995.00" in text  # second ladder level rendered as its own row
-
-
-def test_market_dashboard_flags_changed_cell_on_second_render():
-    dashboard = MarketDashboard()
-    dashboard.render([_snap(our_bid=100.0)], 1.0, 0)
-    group = dashboard.render([_snap(our_bid=200.0)], 2.0, 0)
-    market_table = group.renderables[1]
-    bid_cell = market_table.columns[8]._cells[0]
-    assert bid_cell.style == "bold black on yellow"
-
-
-def test_market_dashboard_does_not_flag_unchanged_cell():
-    dashboard = MarketDashboard()
-    dashboard.render([_snap(our_bid=100.0)], 1.0, 0)
-    group = dashboard.render([_snap(our_bid=100.0)], 2.0, 0)
-    market_table = group.renderables[1]
-    bid_cell = market_table.columns[8]._cells[0]
-    assert bid_cell.style == "green"
-
-
-def test_market_dashboard_renders_regime_table():
-    dashboard = MarketDashboard()
-    regimes = {"BTC": RegimeState(vol_regime="VOLATILE", trend_regime="BULL", sigma_fast=0.9, sigma_slow=0.5, drift=0.2)}
-    text = _rendered_text(dashboard.render([_snap()], 1.0, 0, regimes=regimes))
-    assert "VOLATILE" in text
-    assert "BULL" in text
-
-
-def test_market_dashboard_renders_warmup_panel_only_when_not_ready():
-    dashboard = MarketDashboard()
-    text = _rendered_text(dashboard.render([_snap()], 1.0, 0, warmup_statuses={"BTC": ("fast_vol", 5, 20, 15.0)}))
-    assert "Warming Up" in text
-
-    text_ready = _rendered_text(dashboard.render([_snap()], 1.0, 0, warmup_statuses={"BTC": ("ready", 300, 300, 0.0)}))
-    assert "Warming Up" not in text_ready
-
-
-def test_market_dashboard_renders_recent_fills():
-    dashboard = MarketDashboard()
-    text = _rendered_text(dashboard.render([_snap()], 1.0, 1, recent_fills=[(1.0, "BTC-PERPETUAL", "bid", 81_000.0, 0.01)]))
-    assert "Recent Fills" in text
-    assert "BID" in text
-
+# -- utilization helpers -------------------------------------------------------------------
 
 def test_utilization_zero_limit_is_zero_not_a_crash():
     assert utilization(0.5, 0.0) == 0.0
@@ -154,25 +115,153 @@ def test_utilization_tier_ok_below_elevated_band():
     assert utilization_tier(0.1) == "ok"
 
 
-def _risk(**overrides) -> RiskSnapshot:
-    defaults = dict(
-        position=0.1, max_position=1.0, gross_notional_usd=1_000.0, max_gross_notional_usd=50_000.0,
-        daily_loss_usd=0.0, max_daily_loss_usd=2_000.0, portfolio_delta=0.05, max_abs_delta=0.5,
+def test_spread_bps_none_when_missing_a_side():
+    assert spread_bps(None, 100.0, 100.0) is None
+    assert spread_bps(99.0, None, 100.0) is None
+
+
+def test_spread_bps_computes_relative_to_mid():
+    assert spread_bps(99.0, 101.0, 100.0) == 200.0
+
+
+# -- MarketDashboard (rich: BTC status header + BTC book table + BTC blotter) -----------------
+
+def _renderables(group):
+    return list(group.renderables)
+
+
+def test_market_dashboard_renders_one_book_table_and_one_blotter_focused_on_btc():
+    dashboard = MarketDashboard()
+    group = dashboard.render(
+        [_snap(instrument="BTC-PERPETUAL"), _snap(instrument="ETH-PERPETUAL")], 1.0, 0,
     )
-    defaults.update(overrides)
-    return RiskSnapshot(**defaults)
+    tables = [r for r in _renderables(group) if isinstance(r, Table)]
+    assert [t.title for t in tables] == ["BTC Book", "BTC Blotter"]
 
 
-def test_market_dashboard_renders_risk_table():
+def test_market_dashboard_book_table_lists_perp_and_option_as_separate_rows():
     dashboard = MarketDashboard()
-    text = _rendered_text(dashboard.render([_snap()], 1.0, 0, risk_snapshots={"BTC": _risk()}))
-    assert "Risk" in text
-    assert "BTC" in text
+    group = dashboard.render(
+        [_snap(instrument="BTC-PERPETUAL", kind="perp-quoted"), _snap(instrument="BTC-21SEP26-80000-C", kind="option-quoted", pnl_ccy="BTC")],
+        1.0, 0,
+    )
+    book = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Book")
+    assert book.row_count == 2
+    assert [c.header for c in book.columns] == [
+        "Instrument", "Kind", "Our Bid", "Our Ask", "Mkt Mid", "Position", "Fills",
+        "Unrealized P&L", "Realized Vol", "Fair Vol (IV)", "VRP Edge", "Theo Px",
+    ]
 
 
-def test_market_dashboard_flags_risk_breach_in_red():
+def test_market_dashboard_book_table_shows_option_pricing_and_vrp_edge():
     dashboard = MarketDashboard()
-    group = dashboard.render([_snap()], 1.0, 0, risk_snapshots={"BTC": _risk(position=1.2, max_position=1.0)})
-    risk_table = next(r for r in group.renderables if getattr(r, "title", None) == "Risk")
-    position_cell = risk_table.columns[1]._cells[0]
-    assert position_cell.style == "bold white on red"
+    option_snap = _snap(
+        instrument="BTC-21SEP26-80000-C", kind="option-quoted", pnl_ccy="BTC",
+        realized_vol=0.5, fair_vol=0.6, theo_price=0.021, mid=0.02,
+    )
+    group = dashboard.render([option_snap], 1.0, 0)
+    book = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Book")
+    row_texts = [str(cell) for cell in [book.columns[c]._cells[0] for c in range(len(book.columns))]]
+    assert "0.5000" in row_texts  # realized vol
+    assert "0.6000" in row_texts  # fair (implied) vol
+    assert "+0.1000" in row_texts  # VRP edge = fair - realized
+
+
+def test_market_dashboard_blotter_only_includes_btc_events():
+    dashboard = MarketDashboard()
+    event_log = [
+        _row(instrument="BTC-PERPETUAL", event_type="fill", side="bid", price=81_000.0, size=0.1),
+        _row(instrument="ETH-PERPETUAL", event_type="fill", side="ask", price=3_000.0, size=1.0),
+    ]
+    group = dashboard.render([_snap()], 1.0, 2, event_log=event_log)
+    blotter = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Blotter")
+    assert blotter.row_count == 1
+
+
+def test_market_dashboard_blotter_caps_to_recent_rows():
+    dashboard = MarketDashboard()
+    event_log = [_row(timestamp=float(i), note=f"tick {i}") for i in range(60)]
+    text = _rendered_text(dashboard.render([_snap()], 1.0, 0, event_log=event_log))
+    assert "tick 59" in text
+    assert "tick 0" not in text  # older than the blotter window, scrolled off
+
+
+def test_market_dashboard_blotter_colors_bid_green_and_ask_red():
+    dashboard = MarketDashboard()
+    event_log = [_row(event_type="fill", side="bid", price=81_000.0, size=0.1)]
+    group = dashboard.render([_snap()], 1.0, 0, event_log=event_log)
+    blotter = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Blotter")
+    assert blotter.columns[3]._cells[0].style == "green"
+
+    event_log_ask = [_row(event_type="fill", side="ask", price=81_000.0, size=0.1)]
+    group_ask = dashboard.render([_snap()], 1.0, 0, event_log=event_log_ask)
+    blotter_ask = next(t for t in _renderables(group_ask) if isinstance(t, Table) and t.title == "BTC Blotter")
+    assert blotter_ask.columns[3]._cells[0].style == "red"
+
+
+def test_market_dashboard_blotter_shows_book_and_quote_on_one_merged_row():
+    dashboard = MarketDashboard()
+    event_log = [_row(event_type="quote", book_bid=80_998.0, book_ask=81_003.0, our_bid=80_999.0, our_ask=81_002.0)]
+    group = dashboard.render([_snap()], 1.0, 0, event_log=event_log)
+    blotter = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Blotter")
+    assert blotter.row_count == 1  # book + our quote in a single row, not two separate lines
+
+
+def test_market_dashboard_header_uses_full_words_for_greeks_not_symbols():
+    dashboard = MarketDashboard()
+    text = _rendered_text(dashboard.render(
+        [_snap()], 1.0, 0, portfolio_greeks={"BTC": PortfolioGreeks(delta=0.5, gamma=0.01, vega=1.2, theta=-0.3)},
+        warmup_statuses={"BTC": ("ready", 300, 300, 0.0)},
+    ))
+    assert "Delta" in text and "Gamma" in text and "Vega" in text and "Theta" in text
+    assert "Δ" not in text and "Γ" not in text
+
+
+def test_market_dashboard_header_shows_warmup_and_regime():
+    dashboard = MarketDashboard()
+    regimes = {"BTC": RegimeState(vol_regime="VOLATILE", trend_regime="BULL", sigma_fast=0.9, sigma_slow=0.5, drift=0.2)}
+    text = _rendered_text(dashboard.render(
+        [_snap()], 1.0, 0, regimes=regimes, warmup_statuses={"BTC": ("fast_vol", 5, 20, 15.0)},
+    ))
+    assert "VOLATILE" in text
+    assert "BULL" in text
+    assert "warmup" in text
+
+
+def test_market_dashboard_header_shows_ready_when_warmed_up():
+    dashboard = MarketDashboard()
+    text = _rendered_text(dashboard.render([_snap()], 1.0, 0, warmup_statuses={"BTC": ("ready", 300, 300, 0.0)}))
+    assert "READY" in text
+
+
+def test_market_dashboard_header_includes_a_dim_eth_reference_line():
+    dashboard = MarketDashboard()
+    regimes = {"BTC": RegimeState(vol_regime="CALM", trend_regime="EVEN", sigma_fast=0.1, sigma_slow=0.1, drift=0.0),
+               "ETH": RegimeState(vol_regime="ACTIVE", trend_regime="BEAR", sigma_fast=0.2, sigma_slow=0.1, drift=-0.2)}
+    text = _rendered_text(dashboard.render(
+        [_snap()], 1.0, 0, regimes=regimes,
+        warmup_statuses={"BTC": ("ready", 300, 300, 0.0), "ETH": ("ready", 300, 300, 0.0)},
+    ))
+    assert "ETH" in text
+    assert "ACTIVE" in text
+    assert "BEAR" in text
+
+
+def test_market_dashboard_book_table_position_from_risk_snapshot_for_perp():
+    dashboard = MarketDashboard()
+    text = _rendered_text(dashboard.render(
+        [_snap(n_fills=7)], 1.0, 0,
+        risk_snapshots={"BTC": _risk(position=0.3, max_position=1.5)},
+        warmup_statuses={"BTC": ("ready", 300, 300, 0.0)},
+    ))
+    assert "0.3000" in text
+    assert "7" in text  # fill count
+
+
+def test_market_dashboard_book_table_pnl_colored_green_when_positive_red_when_negative():
+    dashboard = MarketDashboard()
+    positive = dashboard._render_book_table("BTC", [_snap(unrealized_pnl=5.0)], {})
+    negative = dashboard._render_book_table("BTC", [_snap(unrealized_pnl=-5.0)], {})
+    pnl_col = [c.header for c in positive.columns].index("Unrealized P&L")
+    assert positive.columns[pnl_col]._cells[0].style == "green"
+    assert negative.columns[pnl_col]._cells[0].style == "red"
