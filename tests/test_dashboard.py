@@ -40,3 +40,21 @@ def test_render_includes_elapsed_time_and_fill_count():
     output = render_dashboard([_snap()], 123.4, 7)
     assert "123.4" in output
     assert "7" in output
+
+
+def test_render_omits_greeks_section_when_not_provided():
+    output = render_dashboard([_snap()], 1.0, 0)
+    assert "PORTFOLIO GREEKS" not in output
+
+
+def test_render_includes_greeks_section_when_provided():
+    from core.models.greeks_aggregator import PortfolioGreeks
+
+    output = render_dashboard([_snap()], 1.0, 0, portfolio_greeks={"BTC": PortfolioGreeks(delta=0.5, gamma=0.01)})
+    assert "PORTFOLIO GREEKS" in output
+    assert "BTC" in output
+
+
+def test_render_includes_hard_hedge_count():
+    output = render_dashboard([_snap()], 1.0, 0, n_hard_hedges=3)
+    assert "hard hedges: 3" in output

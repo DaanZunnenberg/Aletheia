@@ -1,15 +1,23 @@
 """
-Live paper trading bot: streams real L2 order books (Deribit perpetuals and
-options, Binance spot and perpetual) and quotes against them in real time --
-perps via the existing Avellaneda-Stoikov engine, a nearest-expiry ATM-ish
-option per coin via Black-76 off realized vol (paper/option_quoting.py).
-Binance spot/perp are reference-only (cross-venue display, future hedge
-legs) -- not quoted.
+Live paper trading bot: streams real L2 order books AND real trades (Deribit
+perpetuals and options, Binance spot and perpetual reference-only) and
+quotes against them in real time.
 
-Fills are simulated by crossing (paper/fill_simulator.py) against the live
-book -- **no real orders are ever sent anywhere.** Positions, fills, and
-unrealized P&L are tracked per instrument (paper/position_book.py) and
-rendered to a refreshing terminal dashboard.
+Perps: Avellaneda-Stoikov (core/), with a soft delta-hedge inventory
+override from the option book's aggregated Black-76 Greeks
+(core/models/greeks_aggregator.py, paper/hedger.py). Options: Black-76 off
+realized vol (paper/option_quoting.py), size scaled down near expiry+strike
+(pin risk, core/risk/pin_risk.py). A hard delta-band breach fires an
+immediate (paper) taker hedge against the Deribit perp itself
+(paper/hedger.py, paper/execution_latency.py for slippage).
+
+Fills are matched against the real trade tape via a FIFO-queue-position
+approximation (paper/queue_tracker.py), not L2 top-of-book crossing, and
+gated on the quote having actually been live long enough
+(paper/execution_latency.py) -- **no real orders are ever sent anywhere.**
+Every quote, fill, Greeks snapshot, and hedge is persisted to
+runtime/paper_sessions/*.jsonl (paper/session_log.py) for post-hoc replay
+(paper/session_replay.py).
 
 Run: python examples/paper_trading_bot.py [seconds]
 Defaults to running for 120 seconds (Ctrl-C also works).
@@ -19,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +38,7 @@ from core.models.options.black76 import OptionType
 from deribit.rest import DeribitREST
 from exchanges.binance_connector import BinanceOrderBookConnector
 from exchanges.deribit_connector import DeribitOrderBookConnector
+from exchanges.deribit_trades import DeribitTradeStreamConnector
 from exchanges.stream_manager import MultiExchangeStreamManager, StreamSpec
 from paper.dashboard import render_dashboard
 from paper.engine import PaperTradingEngine, QuotedOption, QuotedPerp
@@ -68,9 +78,8 @@ async def _discover_options() -> list[QuotedOption]:
 
 async def main(run_seconds: float) -> None:
     quoted_options = await _discover_options()
-    option_symbols_by_currency = {
-        opt.underlying_ccy: opt.key[2] for opt in quoted_options
-    }
+    quoted_option_symbols = [opt.key[2] for opt in quoted_options]
+    all_deribit_symbols = list(_DERIBIT_PERP.values()) + quoted_option_symbols
 
     quoted_perps = [QuotedPerp(key=("deribit", "perpetual", name), underlying_ccy=ccy) for ccy, name in _DERIBIT_PERP.items()]
     reference_keys = [
@@ -79,43 +88,65 @@ async def main(run_seconds: float) -> None:
         ("binance", "perpetual", sym) for sym in _BINANCE_SYMBOL.values()
     ]
 
-    engine = PaperTradingEngine(quoted_perps=quoted_perps, quoted_options=quoted_options, reference_keys=reference_keys)
+    session_dir = _REPO_ROOT / "runtime" / "paper_sessions"
+    session_path = session_dir / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.jsonl"
+    log.info("session log: %s", session_path)
+
+    engine = PaperTradingEngine(
+        quoted_perps=quoted_perps, quoted_options=quoted_options, reference_keys=reference_keys,
+        session_log_path=session_path,
+    )
 
     manager = MultiExchangeStreamManager(
         [
             StreamSpec(DeribitOrderBookConnector(), list(_DERIBIT_PERP.values())),
-            StreamSpec(DeribitOrderBookConnector(market_type="option"), list(option_symbols_by_currency.values()), depth=5),
+            StreamSpec(DeribitOrderBookConnector(market_type="option"), quoted_option_symbols, depth=5),
             StreamSpec(BinanceOrderBookConnector("spot"), list(_BINANCE_SYMBOL.values())),
             StreamSpec(BinanceOrderBookConnector("perpetual"), list(_BINANCE_SYMBOL.values())),
         ]
     )
+    trade_connector = DeribitTradeStreamConnector()
 
-    async def consume() -> None:
+    async def consume_books() -> None:
         async for update in manager.stream():
             engine.on_book_update(update)
+
+    async def consume_trades() -> None:
+        async for trade in trade_connector.stream_trades(all_deribit_symbols):
+            engine.on_trade(trade)
 
     async def render_loop() -> None:
         while True:
             await asyncio.sleep(_DASHBOARD_REFRESH_SECONDS)
             elapsed = time.time() - engine.start_time
-            print(render_dashboard(engine.snapshot(), elapsed, engine.n_fills))
+            print(render_dashboard(
+                engine.snapshot(), elapsed, engine.n_fills,
+                portfolio_greeks=engine.portfolio_greeks, n_hard_hedges=engine.n_hard_hedges,
+            ))
 
-    consume_task = asyncio.create_task(consume())
-    render_task = asyncio.create_task(render_loop())
+    tasks = [
+        asyncio.create_task(consume_books()),
+        asyncio.create_task(consume_trades()),
+        asyncio.create_task(render_loop()),
+    ]
     try:
         await asyncio.sleep(run_seconds)
     finally:
-        consume_task.cancel()
-        render_task.cancel()
+        for t in tasks:
+            t.cancel()
         await manager.stop()
-        for t in (consume_task, render_task):
+        for t in tasks:
             try:
                 await t
             except asyncio.CancelledError:
                 pass
+        engine.close()
 
-    print(render_dashboard(engine.snapshot(), time.time() - engine.start_time, engine.n_fills))
-    log.info("done — %d total fills", engine.n_fills)
+    print(render_dashboard(
+        engine.snapshot(), time.time() - engine.start_time, engine.n_fills,
+        portfolio_greeks=engine.portfolio_greeks, n_hard_hedges=engine.n_hard_hedges,
+    ))
+    log.info("done — %d total fills, %d hard hedges, session log: %s", engine.n_fills, engine.n_hard_hedges, session_path)
 
 
 if __name__ == "__main__":

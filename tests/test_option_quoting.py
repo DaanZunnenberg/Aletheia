@@ -44,3 +44,16 @@ def test_put_and_call_price_differently_away_from_the_money():
     call = generate_option_quote(81_000.0, 1 / 365, 0.5, 85_000.0, OptionType.CALL)
     put = generate_option_quote(81_000.0, 1 / 365, 0.5, 85_000.0, OptionType.PUT)
     assert call.bid_price != put.bid_price
+
+
+def test_pin_risk_shrinks_size_near_expiry_at_the_strike():
+    normal = generate_option_quote(81_000.0, 1 / 365, 0.5, 81_000.0, OptionType.CALL)
+    pinned = generate_option_quote(81_000.0, 1e-7, 0.5, 81_000.0, OptionType.CALL)
+    assert pinned.bid_size < normal.bid_size
+    assert any("pin risk" in b for b in pinned.breaches)
+
+
+def test_pin_risk_does_not_shrink_size_far_from_expiry():
+    q = generate_option_quote(81_000.0, 30 / 365, 0.5, 81_000.0, OptionType.CALL)
+    assert q.bid_size == 0.1
+    assert q.breaches == ()
