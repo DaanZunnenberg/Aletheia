@@ -130,38 +130,63 @@ def _renderables(group):
     return list(group.renderables)
 
 
-def test_market_dashboard_renders_one_book_table_and_one_blotter_focused_on_btc():
+def _book_tables(group):
+    # Perp OB and Option OB sit side by side in a single-row Table.grid
+    # (title=None distinguishes the grid from the two titled tables inside it).
+    grid = next(r for r in _renderables(group) if isinstance(r, Table) and r.title is None)
+    return [column._cells[0] for column in grid.columns]
+
+
+def test_market_dashboard_renders_separate_perp_and_option_tables_plus_one_blotter_focused_on_btc():
     dashboard = MarketDashboard()
     group = dashboard.render(
         [_snap(instrument="BTC-PERPETUAL"), _snap(instrument="ETH-PERPETUAL")], 1.0, 0,
     )
-    tables = [r for r in _renderables(group) if isinstance(r, Table)]
-    assert [t.title for t in tables] == ["BTC Book", "BTC Blotter"]
+    titled_tables = [r for r in _renderables(group) if isinstance(r, Table) and r.title is not None]
+    assert [t.title for t in titled_tables] == ["BTC Blotter"]
+    perp_table, option_table = _book_tables(group)
+    assert perp_table.title == "BTC Perp OB"
+    assert option_table.title == "BTC Option OB"
 
 
-def test_market_dashboard_book_table_lists_perp_and_option_as_separate_rows():
+def test_market_dashboard_perp_and_option_are_separate_tables_each_with_only_their_own_instrument():
     dashboard = MarketDashboard()
     group = dashboard.render(
         [_snap(instrument="BTC-PERPETUAL", kind="perp-quoted"), _snap(instrument="BTC-21SEP26-80000-C", kind="option-quoted", pnl_ccy="BTC")],
         1.0, 0,
     )
-    book = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Book")
-    assert book.row_count == 2
-    assert [c.header for c in book.columns] == [
-        "Instrument", "Kind", "Our Bid", "Our Ask", "Mkt Mid", "Position", "Fills",
-        "Unrealized P&L", "Realized Vol", "Fair Vol (IV)", "VRP Edge", "Theo Px",
+    perp_table, option_table = _book_tables(group)
+    assert perp_table.row_count == 1
+    assert option_table.row_count == 1
+    assert [c.header for c in perp_table.columns] == [
+        "Instrument", "OurBid", "OurAsk", "BookBid", "BookAsk", "Spread",
+        "Mid", "Position", "Fills", "uPnL",
+    ]
+    assert [c.header for c in option_table.columns] == [
+        "Instrument", "OurBid", "OurAsk", "Mid", "Position", "Fills",
+        "uPnL", "RVol", "IVol", "VRP", "Theo",
     ]
 
 
-def test_market_dashboard_book_table_shows_option_pricing_and_vrp_edge():
+def test_market_dashboard_option_table_unaffected_by_perp_only_snapshot():
+    """Each table reflects only its own instrument -- an option row never appears in the perp table or vice versa."""
+    dashboard = MarketDashboard()
+    group = dashboard.render([_snap(instrument="BTC-PERPETUAL", kind="perp-quoted")], 1.0, 0)
+    perp_table, option_table = _book_tables(group)
+    assert perp_table.row_count == 1
+    assert option_table.row_count == 1  # placeholder "warming up" row, no option snapshot yet
+    assert "BTC-PERPETUAL" not in [str(option_table.columns[0]._cells[0])]
+
+
+def test_market_dashboard_option_table_shows_option_pricing_and_vrp_edge():
     dashboard = MarketDashboard()
     option_snap = _snap(
         instrument="BTC-21SEP26-80000-C", kind="option-quoted", pnl_ccy="BTC",
         realized_vol=0.5, fair_vol=0.6, theo_price=0.021, mid=0.02,
     )
     group = dashboard.render([option_snap], 1.0, 0)
-    book = next(t for t in _renderables(group) if isinstance(t, Table) and t.title == "BTC Book")
-    row_texts = [str(cell) for cell in [book.columns[c]._cells[0] for c in range(len(book.columns))]]
+    _, option_table = _book_tables(group)
+    row_texts = [str(cell) for cell in [option_table.columns[c]._cells[0] for c in range(len(option_table.columns))]]
     assert "0.5000" in row_texts  # realized vol
     assert "0.6000" in row_texts  # fair (implied) vol
     assert "+0.1000" in row_texts  # VRP edge = fair - realized
@@ -258,10 +283,10 @@ def test_market_dashboard_book_table_position_from_risk_snapshot_for_perp():
     assert "7" in text  # fill count
 
 
-def test_market_dashboard_book_table_pnl_colored_green_when_positive_red_when_negative():
+def test_market_dashboard_perp_table_pnl_colored_green_when_positive_red_when_negative():
     dashboard = MarketDashboard()
-    positive = dashboard._render_book_table("BTC", [_snap(unrealized_pnl=5.0)], {})
-    negative = dashboard._render_book_table("BTC", [_snap(unrealized_pnl=-5.0)], {})
-    pnl_col = [c.header for c in positive.columns].index("Unrealized P&L")
+    positive = dashboard._render_perp_table("BTC", [_snap(unrealized_pnl=5.0)], {})
+    negative = dashboard._render_perp_table("BTC", [_snap(unrealized_pnl=-5.0)], {})
+    pnl_col = [c.header for c in positive.columns].index("uPnL")
     assert positive.columns[pnl_col]._cells[0].style == "green"
     assert negative.columns[pnl_col]._cells[0].style == "red"

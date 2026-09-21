@@ -116,6 +116,11 @@ def _fmt_price(x: float | None) -> str:
     return f"{x:.6f}"
 
 
+def _fmt_coin_price(x: float | None) -> str:
+    """Compact 4-decimal form for coin-denominated option prices -- fits the Option OB table's narrow columns."""
+    return "--" if x is None else f"{x:.4f}"
+
+
 def _fmt_size(x: float | None) -> str:
     return "--" if x is None else f"{x:,.4f}"
 
@@ -125,14 +130,17 @@ class MarketDashboard:
     `rich`-based live terminal view, focused on the primary currency
     (BTC): a compact one-line status strip (status/regime/Greeks in words)
     plus a one-line ETH reference strip (dimmer, awareness only, no full
-    breakdown), a per-instrument "Book" table (perp + option side by side
-    by row, including option pricing detail -- realized vol, the IV we
-    actually quote at, the VRP edge between them, and our theoretical
-    price vs. the market's), and one scrolling blotter table (one row per
-    discrete event -- a merged book+quote snapshot, a fill, or a hard
-    hedge -- newest at the bottom). Tight panel/table padding throughout.
-    Plain white text; green/red appear only for buy-vs-sell (bid/ask) and
-    profit-vs-loss, never as decoration.
+    breakdown), two side-by-side order-book tables -- Perp OB (our quote,
+    the real book's own bid/ask/spread, position, P&L) and Option OB (the
+    same plus pricing/stat-arb detail: realized vol, the IV we actually
+    quote at, the VRP edge between them, and our theoretical price vs. the
+    market's) -- each reflecting only its own instrument's latest snapshot,
+    so one never changes because the other instrument ticked, and one
+    scrolling blotter table (one row per discrete event -- a merged
+    book+quote snapshot, a fill, or a hard hedge -- newest at the bottom).
+    Tight panel/table padding throughout. Plain white text; green/red
+    appear only for buy-vs-sell (bid/ask) and profit-vs-loss, never as
+    decoration.
     """
 
     _PRIMARY_CCY = "BTC"
@@ -166,44 +174,76 @@ class MarketDashboard:
             text.append("  Delta --  Gamma --  Vega --  Theta --", style=base)
         return text
 
-    def _render_book_table(
-        self,
-        ccy: str,
-        snapshots: list[InstrumentSnapshot],
-        risk_snapshots: dict,
-    ) -> Table:
-        # A real Table, not hand-padded text -- rich sizes every column to its
-        # widest cell and aligns the whole grid for us. One row per
-        # instrument (perp + option), not per currency, so option pricing
-        # detail (RV/IV/edge/theo) has somewhere to live without inventing a
-        # second table -- perp rows simply leave those columns blank.
-        table = Table(title=f"{ccy} Book", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False)
-        for col, justify in [
-            ("Instrument", "left"), ("Kind", "left"), ("Our Bid", "right"), ("Our Ask", "right"),
-            ("Mkt Mid", "right"), ("Position", "right"), ("Fills", "right"), ("Unrealized P&L", "right"),
-            ("Realized Vol", "right"), ("Fair Vol (IV)", "right"), ("VRP Edge", "right"), ("Theo Px", "right"),
-        ]:
-            table.add_column(col, justify=justify)
+    def _position_cell(self, s: InstrumentSnapshot, risk_snapshots: dict, ccy: str) -> Text:
+        r = risk_snapshots.get(ccy)
+        if s.kind == "perp-quoted" and r is not None:
+            breach_style = _UTILIZATION_STYLE[utilization_tier(utilization(r.position, r.max_position))]
+            pos_style = _GREEN if r.position > 0 else (_RED if r.position < 0 else "")
+            return Text(f"{r.position:+.4f}", style=pos_style or breach_style)
+        pos_style = _GREEN if s.position_qty > 0 else (_RED if s.position_qty < 0 else "")
+        return Text(f"{s.position_qty:+.4f}", style=pos_style)
 
-        rows = [s for s in snapshots if s.instrument.startswith(ccy) and s.kind in ("perp-quoted", "option-quoted")]
+    def _render_perp_table(self, ccy: str, snapshots: list[InstrumentSnapshot], risk_snapshots: dict) -> Table:
+        # The perp order book: our own quote plus the real exchange's best
+        # bid/ask and depth at that level -- distinct from the option table
+        # below (different instrument, different book, updates on its own
+        # book stream and is untouched by option-side activity).
+        # Explicit no_wrap width per column -- rather than autosized headers,
+        # which wrap to two lines at different points for the perp vs. option
+        # table and throw the two tables' rows out of vertical alignment.
+        table = Table(title=f"{ccy} Perp OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False)
+        for col, justify, width in [
+            ("Instrument", "left", 12), ("OurBid", "right", 9), ("OurAsk", "right", 9), ("BookBid", "right", 9),
+            ("BookAsk", "right", 9), ("Spread", "right", 6), ("Mid", "right", 9), ("Position", "right", 8),
+            ("Fills", "right", 5), ("uPnL", "right", 11),
+        ]:
+            table.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis" if col == "Instrument" else "crop")
+
+        rows = [s for s in snapshots if s.instrument.startswith(ccy) and s.kind == "perp-quoted"]
         if not rows:
-            table.add_row("--", "warming up", *([""] * 10))
+            table.add_row("--", *([""] * 9))
             return table
 
-        r = risk_snapshots.get(ccy)
-        breach_style = lambda u: _UTILIZATION_STYLE[utilization_tier(u)]  # noqa: E731
+        for s in rows:
+            pnl_style = _GREEN if s.unrealized_pnl > 0 else (_RED if s.unrealized_pnl < 0 else "")
+            book_bid = s.book_bids[0][0] if s.book_bids else None
+            book_ask = s.book_asks[0][0] if s.book_asks else None
+            bps = spread_bps(book_bid, book_ask, s.mid)
+            table.add_row(
+                s.instrument,
+                Text(_fmt_price(s.our_bid), style=_GREEN if s.our_bid is not None else ""),
+                Text(_fmt_price(s.our_ask), style=_RED if s.our_ask is not None else ""),
+                Text(_fmt_price(book_bid), style=_GREEN if book_bid is not None else ""),
+                Text(_fmt_price(book_ask), style=_RED if book_ask is not None else ""),
+                "--" if bps is None else f"{bps:,.1f}",
+                _fmt_price(s.mid), self._position_cell(s, risk_snapshots, ccy), str(s.n_fills),
+                Text(f"{s.unrealized_pnl:+.4f}{s.pnl_ccy}", style=pnl_style),
+            )
+        return table
+
+    def _render_option_table(self, ccy: str, snapshots: list[InstrumentSnapshot], risk_snapshots: dict) -> Table:
+        # The option order book: same shape of columns as the perp table
+        # where they apply (own quote, position, fills, P&L) plus pricing/
+        # stat-arb detail that has no perp equivalent -- realized vol, the
+        # fair (implied) vol we actually quote at, the VRP edge between
+        # them, and our Black-76 theoretical price vs. the market's own
+        # mid. A different instrument/book entirely, updates independently
+        # of the perp table above.
+        table = Table(title=f"{ccy} Option OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False)
+        for col, justify, width in [
+            ("Instrument", "left", 14), ("OurBid", "right", 7), ("OurAsk", "right", 7), ("Mid", "right", 7),
+            ("Position", "right", 8), ("Fills", "right", 5), ("uPnL", "right", 11),
+            ("RVol", "right", 6), ("IVol", "right", 6), ("VRP", "right", 7), ("Theo", "right", 8),
+        ]:
+            table.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis" if col == "Instrument" else "crop")
+
+        rows = [s for s in snapshots if s.instrument.startswith(ccy) and s.kind == "option-quoted"]
+        if not rows:
+            table.add_row("--", *([""] * 10))
+            return table
 
         for s in rows:
-            kind_label = "perp" if s.kind == "perp-quoted" else "option"
-            if s.kind == "perp-quoted" and r is not None:
-                pos_style = _GREEN if r.position > 0 else (_RED if r.position < 0 else "")
-                position = Text(f"{r.position:+.4f}", style=pos_style or breach_style(utilization(r.position, r.max_position)))
-            else:
-                pos_style = _GREEN if s.position_qty > 0 else (_RED if s.position_qty < 0 else "")
-                position = Text(f"{s.position_qty:+.4f}", style=pos_style)
-
             pnl_style = _GREEN if s.unrealized_pnl > 0 else (_RED if s.unrealized_pnl < 0 else "")
-            pnl = Text(f"{s.unrealized_pnl:+.4f}{s.pnl_ccy}", style=pnl_style)
 
             if s.fair_vol is not None and s.realized_vol is not None:
                 vrp_edge = s.fair_vol - s.realized_vol
@@ -216,15 +256,16 @@ class MarketDashboard:
                 # theo vs. real market mid -- positive means our model thinks the
                 # option is cheap relative to where the market itself trades.
                 theo_edge = s.theo_price - s.mid
-                theo_cell = Text(f"{s.theo_price:.6f}", style=_GREEN if theo_edge > 0 else (_RED if theo_edge < 0 else ""))
+                theo_cell = Text(_fmt_coin_price(s.theo_price), style=_GREEN if theo_edge > 0 else (_RED if theo_edge < 0 else ""))
             else:
                 theo_cell = "--"
 
             table.add_row(
-                s.instrument, kind_label,
-                Text(_fmt_price(s.our_bid), style=_GREEN if s.our_bid is not None else ""),
-                Text(_fmt_price(s.our_ask), style=_RED if s.our_ask is not None else ""),
-                _fmt_price(s.mid), position, str(s.n_fills), pnl,
+                s.instrument,
+                Text(_fmt_coin_price(s.our_bid), style=_GREEN if s.our_bid is not None else ""),
+                Text(_fmt_coin_price(s.our_ask), style=_RED if s.our_ask is not None else ""),
+                _fmt_coin_price(s.mid), self._position_cell(s, risk_snapshots, ccy), str(s.n_fills),
+                Text(f"{s.unrealized_pnl:+.4f}{s.pnl_ccy}", style=pnl_style),
                 realized_vol_cell, fair_vol_cell, edge_text, theo_cell,
             )
         return table
@@ -294,10 +335,22 @@ class MarketDashboard:
             title.append(self._render_status_line(other, regimes.get(other), warmup_statuses.get(other), portfolio_greeks.get(other), dim=True))
 
         header = Panel(title, box=box.HEAVY, border_style="dim", padding=(0, 1))
-        book_table = self._render_book_table(ccy, snapshots, risk_snapshots)
+        perp_table = self._render_perp_table(ccy, snapshots, risk_snapshots)
+        option_table = self._render_option_table(ccy, snapshots, risk_snapshots)
         blotter = self._render_blotter(ccy, [row for row in (event_log or []) if row.instrument.startswith(ccy)])
 
-        return Group(header, book_table, blotter)
+        # Table.grid, not Columns -- Columns silently stacks vertically once
+        # the combined width won't fit; a grid with equal-ratio columns
+        # forces true side-by-side placement and shrinks each table's own
+        # columns to fit instead. Each table only reflects its own
+        # instrument's snapshot data -- the perp table never changes because
+        # the option book ticked, and vice versa.
+        books = Table.grid(expand=True, padding=(0, 1, 0, 0))
+        books.add_column(ratio=1)
+        books.add_column(ratio=1)
+        books.add_row(perp_table, option_table)
+
+        return Group(header, books, blotter)
 
 
 def render_dashboard(
