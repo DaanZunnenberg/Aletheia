@@ -74,9 +74,11 @@ def test_no_quote_before_volatility_warmup():
 def test_perp_quote_appears_after_warmup():
     engine = _new_engine()
     _warm_up_perp(engine)
-    assert _PERP_KEY in engine.resting_quotes
-    quote = engine.resting_quotes[_PERP_KEY]
-    assert quote.bid_price < quote.ask_price
+    assert _PERP_KEY in engine.resting_ladders
+    ladder = engine.resting_ladders[_PERP_KEY]
+    assert ladder.bid_levels[0].price < ladder.ask_levels[0].price
+    assert len(ladder.bid_levels) == 3  # default LadderParams.n_levels
+    assert len(ladder.ask_levels) == 3
 
 
 def test_reference_stream_is_never_quoted():
@@ -89,9 +91,11 @@ def test_reference_stream_is_never_quoted():
 def test_perp_fill_via_trade_tape_walking_through_our_bid():
     engine = _new_engine()
     _warm_up_perp(engine, seed=1)
-    quote = engine.resting_quotes[_PERP_KEY]
+    ladder = engine.resting_ladders[_PERP_KEY]
+    # walk through the deepest bid level -- guarantees every level fills
+    deepest_bid = ladder.bid_levels[-1].price
 
-    trade = _trade("BTC-PERPETUAL", price=quote.bid_price - 1.0, amount=1.0, direction="sell", t=31.0)
+    trade = _trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=31.0)
     engine.on_trade(trade)
 
     assert engine.position_book.position_for("deribit:perpetual:BTC-PERPETUAL").quantity > 0.0
@@ -103,9 +107,10 @@ def test_trade_before_latency_elapses_does_not_fill():
     time to see our (not-yet-live) quote -- must not fill."""
     engine = _new_engine()
     _warm_up_perp(engine, seed=1)
-    quote = engine.resting_quotes[_PERP_KEY]
+    ladder = engine.resting_ladders[_PERP_KEY]
+    deepest_bid = ladder.bid_levels[-1].price
 
-    trade = _trade("BTC-PERPETUAL", price=quote.bid_price - 1.0, amount=1.0, direction="sell", t=29.0)
+    trade = _trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=29.0)
     engine.on_trade(trade)
     assert engine.n_fills == 0
 
@@ -220,11 +225,105 @@ def test_session_log_records_quotes_and_fills(tmp_path):
     log_path = tmp_path / "session.jsonl"
     engine = _new_engine(session_log_path=log_path)
     _warm_up_perp(engine, seed=1)
-    quote = engine.resting_quotes[_PERP_KEY]
-    engine.on_trade(_trade("BTC-PERPETUAL", price=quote.bid_price - 1.0, amount=1.0, direction="sell", t=31.0))
+    ladder = engine.resting_ladders[_PERP_KEY]
+    deepest_bid = ladder.bid_levels[-1].price
+    engine.on_trade(_trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=31.0))
     engine.close()
 
     events = load_session(log_path)
     assert any(e.event_type == "quote" for e in events)
     assert any(e.event_type == "fill" for e in events)
     assert any(e.event_type == "greeks" for e in events)
+
+
+def test_warmup_status_starts_at_fast_vol_stage():
+    engine = _new_engine()
+    engine.on_book_update(_perp_update(81_000.0, t=0.0))
+    stage, collected, needed, eta = engine.warmup_status("BTC")
+    assert stage == "fast_vol"
+    assert collected == 1
+    assert eta > 0.0
+
+
+def test_warmup_status_progresses_to_regime_stage_after_fast_vol_ready():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=0)  # 30 bars -- clears fast_vol (20) but not regime (300)
+    stage, collected, needed, eta = engine.warmup_status("BTC")
+    assert stage == "regime"
+    assert collected == 30
+    assert eta > 0.0
+
+
+def test_warmup_status_reaches_ready_after_enough_bars():
+    engine = _new_engine()
+    rng = np.random.default_rng(0)
+    mid = 81_000.0
+    for i in range(310):
+        mid += rng.normal(0, 1.0)
+        engine.on_book_update(_perp_update(mid, t=float(i)))
+    stage, collected, needed, eta = engine.warmup_status("BTC")
+    assert stage == "ready"
+    assert eta == 0.0
+
+
+def test_no_regime_before_warmup_completes():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=0)
+    assert "BTC" not in engine.regimes
+
+
+def test_regime_appears_once_warmed_up():
+    engine = _new_engine()
+    rng = np.random.default_rng(0)
+    mid = 81_000.0
+    for i in range(310):
+        mid += rng.normal(0, 1.0)
+        engine.on_book_update(_perp_update(mid, t=float(i)))
+    assert "BTC" in engine.regimes
+    regime = engine.regimes["BTC"]
+    assert regime.vol_regime in {"CALM", "NORMAL", "ACTIVE", "VOLATILE"}
+    assert regime.trend_regime in {"BULL", "BEAR", "EVEN"}
+
+
+def test_sustained_uptrend_is_classified_bull():
+    engine = _new_engine()
+    mid = 81_000.0
+    for i in range(310):
+        mid *= 1.0002  # steady upward drift, no noise
+        engine.on_book_update(_perp_update(mid, t=float(i)))
+    assert engine.regimes["BTC"].trend_regime == "BULL"
+
+
+def test_update_event_is_set_on_book_update():
+    engine = _new_engine()
+    assert not engine.update_event.is_set()
+    engine.on_book_update(_perp_update(81_000.0, t=0.0))
+    assert engine.update_event.is_set()
+
+
+def test_update_event_is_set_on_fill():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=1)
+    engine.update_event.clear()
+    ladder = engine.resting_ladders[_PERP_KEY]
+    deepest_bid = ladder.bid_levels[-1].price
+    engine.on_trade(_trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=31.0))
+    assert engine.update_event.is_set()
+
+
+def test_risk_snapshots_empty_before_perp_has_a_book():
+    engine = _new_engine()
+    assert engine.risk_snapshots() == {}
+
+
+def test_risk_snapshots_reports_position_against_limits():
+    engine = _new_engine()
+    _warm_up_perp(engine, seed=1)
+    ladder = engine.resting_ladders[_PERP_KEY]
+    deepest_bid = ladder.bid_levels[-1].price
+    engine.on_trade(_trade("BTC-PERPETUAL", price=deepest_bid - 1.0, amount=1.0, direction="sell", t=31.0))
+    snapshot = engine.risk_snapshots()["BTC"]
+    assert snapshot.position > 0.0
+    assert snapshot.max_position == 1.0
+    assert snapshot.max_gross_notional_usd == 50_000.0
+    assert snapshot.max_abs_delta == HardHedgeLimits().max_abs_delta

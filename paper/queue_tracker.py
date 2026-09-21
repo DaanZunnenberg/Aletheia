@@ -64,40 +64,55 @@ def process_trade_against_order(order: RestingOrder, trade_price: float, trade_a
 
 class QueueTracker:
     """
-    Stateful wrapper: one RestingOrder per (instrument, side) key, updated as
-    real trades arrive. place_order() resets queue position whenever we
-    requote (a new price means a new position at the back of a new queue).
+    Stateful wrapper: one RestingOrder per (instrument, side, level) key --
+    level defaults to 0 for single-level (option) quoting, and is 0..N-1 for
+    a multi-level ladder (see core/models/ladder.py), tightest first.
+    place_order() resets queue position whenever we requote a given level (a
+    new price means a new position at the back of a new queue).
+
+    Multiple levels of the same side are always at *distinct* prices (the
+    ladder's kappa-derived gap is > 0), so a single trade can be checked
+    against every level independently with the exact same (trade_price,
+    trade_amount) -- no leftover-volume bookkeeping needs to cascade between
+    levels. A trade that walks through a deep level necessarily also walks
+    through every shallower level at the *same* price comparison, and a
+    trade printing exactly at one level's price can't simultaneously match
+    a different level's (distinct) price, so there's no double-counting.
     """
 
     def __init__(self) -> None:
-        self._orders: dict[tuple[str, str], RestingOrder] = {}
+        self._orders: dict[tuple[str, str, int], RestingOrder] = {}
 
-    def place_order(self, instrument: str, side: str, price: float, size: float, size_ahead: float) -> None:
-        self._orders[(instrument, side)] = RestingOrder(price=price, side=side, size=size, remaining_ahead=size_ahead)
+    def place_order(self, instrument: str, side: str, price: float, size: float, size_ahead: float, level: int = 0) -> None:
+        self._orders[(instrument, side, level)] = RestingOrder(price=price, side=side, size=size, remaining_ahead=size_ahead)
 
-    def clear_order(self, instrument: str, side: str) -> None:
-        self._orders.pop((instrument, side), None)
+    def clear_order(self, instrument: str, side: str, level: int = 0) -> None:
+        self._orders.pop((instrument, side, level), None)
 
-    def on_trade(self, instrument: str, trade_price: float, trade_amount: float) -> list[tuple[str, float]]:
+    def clear_side(self, instrument: str, side: str) -> None:
+        """Remove every level resting on `side` -- used before requoting a ladder to a fresh level count/prices."""
+        for key in [k for k in self._orders if k[0] == instrument and k[1] == side]:
+            del self._orders[key]
+
+    def on_trade(self, instrument: str, trade_price: float, trade_amount: float) -> list[tuple[str, int, float]]:
         """
-        Feed a real trade to both sides' resting orders for `instrument`.
-        Returns [(side, filled_size), ...] for any side that filled (partially
-        or fully) on this trade. A filled order is cleared (assumes full
-        consumption at our quoted size, not partial resting after a fill --
-        matches this project's convention elsewhere of "small resting size
-        vs. real trade size").
+        Feed a real trade to every resting level (both sides) for `instrument`.
+        Returns [(side, level, filled_size), ...] for any level that filled
+        (partially or fully) on this trade. A filled level is cleared
+        (assumes full consumption at our quoted size, not partial resting
+        after a fill -- matches this project's convention elsewhere of
+        "small resting size vs. real trade size").
         """
         fills = []
-        for side in ("bid", "ask"):
-            order = self._orders.get((instrument, side))
-            if order is None:
-                continue
+        for key in [k for k in self._orders if k[0] == instrument]:
+            _, side, level = key
+            order = self._orders[key]
             result = process_trade_against_order(order, trade_price, trade_amount)
             if result.filled_size > 0.0:
-                fills.append((side, result.filled_size))
-                self.clear_order(instrument, side)
+                fills.append((side, level, result.filled_size))
+                del self._orders[key]
             else:
-                self._orders[(instrument, side)] = RestingOrder(
+                self._orders[key] = RestingOrder(
                     price=order.price, side=order.side, size=order.size, remaining_ahead=result.remaining_ahead
                 )
         return fills

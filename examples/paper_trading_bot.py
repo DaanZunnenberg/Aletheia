@@ -30,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from rich.live import Live
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -40,14 +42,12 @@ from exchanges.binance_connector import BinanceOrderBookConnector
 from exchanges.deribit_connector import DeribitOrderBookConnector
 from exchanges.deribit_trades import DeribitTradeStreamConnector
 from exchanges.stream_manager import MultiExchangeStreamManager, StreamSpec
-from paper.dashboard import render_dashboard
+from paper.dashboard import MarketDashboard
 from paper.engine import PaperTradingEngine, QuotedOption, QuotedPerp
 from paper.instruments import find_near_the_money_option
 from utils.logger import get_logger
 
 log = get_logger(__name__)
-
-_DASHBOARD_REFRESH_SECONDS = 1.0
 
 _DERIBIT_PERP = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL"}
 _BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
@@ -115,37 +115,45 @@ async def main(run_seconds: float) -> None:
         async for trade in trade_connector.stream_trades(all_deribit_symbols):
             engine.on_trade(trade)
 
-    async def render_loop() -> None:
+    dashboard = MarketDashboard()
+
+    def _render():
+        elapsed = time.time() - engine.start_time
+        return dashboard.render(
+            engine.snapshot(), elapsed, engine.n_fills,
+            n_hard_hedges=engine.n_hard_hedges, portfolio_greeks=engine.portfolio_greeks,
+            regimes=engine.regimes, warmup_statuses=engine.warmup_statuses(),
+            recent_fills=list(engine.recent_fills), risk_snapshots=engine.risk_snapshots(),
+        )
+
+    async def render_loop(live: Live) -> None:
+        # Redraws on every book update/trade fill (engine.update_event), not on a fixed
+        # timer -- the table is only ever as stale as the last real market event.
         while True:
-            await asyncio.sleep(_DASHBOARD_REFRESH_SECONDS)
-            elapsed = time.time() - engine.start_time
-            print(render_dashboard(
-                engine.snapshot(), elapsed, engine.n_fills,
-                portfolio_greeks=engine.portfolio_greeks, n_hard_hedges=engine.n_hard_hedges,
-            ))
+            await engine.update_event.wait()
+            engine.update_event.clear()
+            live.update(_render())
 
     tasks = [
         asyncio.create_task(consume_books()),
         asyncio.create_task(consume_trades()),
-        asyncio.create_task(render_loop()),
     ]
-    try:
-        await asyncio.sleep(run_seconds)
-    finally:
-        for t in tasks:
-            t.cancel()
-        await manager.stop()
-        for t in tasks:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-        engine.close()
+    with Live(_render(), refresh_per_second=20, screen=True) as live:
+        tasks.append(asyncio.create_task(render_loop(live)))
+        try:
+            await asyncio.sleep(run_seconds)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await manager.stop()
+            for t in tasks:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            engine.close()
+            live.update(_render())
 
-    print(render_dashboard(
-        engine.snapshot(), time.time() - engine.start_time, engine.n_fills,
-        portfolio_greeks=engine.portfolio_greeks, n_hard_hedges=engine.n_hard_hedges,
-    ))
     log.info("done — %d total fills, %d hard hedges, session log: %s", engine.n_fills, engine.n_hard_hedges, session_path)
 
 

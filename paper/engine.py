@@ -1,28 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
+from collections import deque
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from core.market_state import MarketState
 from core.models.greeks_aggregator import (
     PortfolioGreeks,
     aggregate_portfolio,
     option_position_greeks,
     perp_position_greeks,
 )
+from core.models.glft import GLFTParams
+from core.models.ladder import LadderParams, LadderQuoteDecision, generate_ladder_quotes
 from core.models.options.black76 import OptionType, black76_greeks
-from core.models.quoting import QuotingParams
-from core.models.volatility import ewma_volatility
+from core.models.regime_monitor import RegimeState, classify_trend_regime, classify_vol_regime
+from core.models.volatility import ema_drift, ewma_volatility
 from core.risk.limits import RiskLimits
-from core.strategies.market_maker import QuoteDecision, generate_quotes
+from core.strategies.market_maker import QuoteDecision
 from data.orderbook import OrderBookUpdate
 from deribit.types import Trade
 from paper.bar_builder import LiveBarAggregator
-from paper.dashboard import InstrumentSnapshot
+from paper.dashboard import InstrumentSnapshot, RiskSnapshot
 from paper.execution_latency import LatencyModel, is_quote_live
 from paper.execution_latency import taker_slippage_price
 from paper.fill_simulator import PaperFill
@@ -35,9 +38,14 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-_VOL_HALFLIFE_SECONDS = 60.0
-_VOL_WARMUP_UPDATES = 20
-_PERP_PARAMS = QuotingParams(gamma=5.0, time_horizon=1.0, kappa=1.5, A=0.05)
+_VOL_HALFLIFE_SECONDS = 60.0        # "HFT" fast vol estimate -- reacts within seconds
+_VOL_WARMUP_UPDATES = 20            # bars before the fast estimate is trusted at all
+_SLOW_HALFLIFE_SECONDS = 600.0      # "macro" slow vol estimate -- 10 min halflife
+_DRIFT_HALFLIFE_SECONDS = 900.0     # macro trend EMA -- 15 min halflife
+_REGIME_WARMUP_BARS = 300           # bars before the slow/macro regime axis is trusted (5 min at 1s bars) --
+                                     # a 600s-halflife EWMA computed from 20s of data is meaningless noise, not a baseline
+_PERP_GLFT_PARAMS = GLFTParams(gamma=5.0, kappa=1.5, A=0.05, q_max=1.0)
+_PERP_LADDER_PARAMS = LadderParams(n_levels=3, intensity_decay_per_level=0.5, size_decay_per_level=0.6)
 _PERP_LIMITS = RiskLimits()
 _SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
 
@@ -79,16 +87,18 @@ class QuotedOption:
 class PaperTradingEngine:
     """
     Dry-run market-making engine. Consumes OrderBookUpdate events (quoting)
-    and Trade events (fills), and wires together every layer built for this
-    pass: core.strategies.market_maker (perp AS quoting, now with a soft
-    delta-hedge inventory override), paper.option_quoting (Black-76 options),
-    paper.queue_tracker (FIFO-approximation fills against real trades, not
-    L2-crossing), paper.execution_latency (fills gated on the quote actually
-    having been live long enough), core.models.greeks_aggregator (portfolio
-    Greeks across the option + perp book), paper.hedger (soft continuous
-    hedging via the AS skew mechanism, hard threshold-triggered hedging),
-    and paper.session_log (every quote/fill/Greeks snapshot/hedge persisted
-    to disk). No real orders are ever sent anywhere.
+    and Trade events (fills), and wires together every layer built so far:
+    perps quote a multi-level GLFT ladder (core.models.ladder, level spacing
+    tied to kappa, sizes decaying geometrically -- see LadderParams), with a
+    soft delta-hedge inventory override; options quote a single Black-76
+    level (paper.option_quoting). Both flow through paper.queue_tracker
+    (FIFO-approximation fills against real trades, not L2-crossing) and
+    paper.execution_latency (fills gated on the quote actually having been
+    live long enough). core.models.greeks_aggregator aggregates portfolio
+    Greeks across the option + perp book; paper.hedger drives soft
+    (continuous, via the ladder's own skew) and hard (threshold-triggered)
+    hedging. Every quote/fill/Greeks snapshot/hedge is persisted via
+    paper.session_log. No real orders are ever sent anywhere.
 
     Reference-only streams (e.g. Binance spot/perp here) are tracked for
     display but not quoted.
@@ -109,7 +119,8 @@ class PaperTradingEngine:
         self._reference_keys = set(reference_keys)
 
         self.latest_books: dict[tuple[str, str, str], OrderBookUpdate] = {}
-        self.resting_quotes: dict[tuple[str, str, str], QuoteDecision] = {}
+        self.resting_quotes: dict[tuple[str, str, str], QuoteDecision] = {}      # options: single level
+        self.resting_ladders: dict[tuple[str, str, str], LadderQuoteDecision] = {}  # perps: multi-level
         self.position_book = PositionBook()
         self.queue_tracker = QueueTracker()
         self.latency_model = latency_model or LatencyModel()
@@ -118,6 +129,7 @@ class PaperTradingEngine:
         self._quote_live_at: dict[tuple[str, str, str], float] = {}
         self.session_logger = SessionLogger(session_log_path) if session_log_path is not None else None
         self.portfolio_greeks: dict[str, PortfolioGreeks] = {}
+        self.regimes: dict[str, RegimeState] = {}
 
         # Fixed-interval bars, not raw ticks: ewma_volatility() assumes evenly-
         # spaced samples (it scales annualisation by a fixed sampling_seconds),
@@ -130,6 +142,8 @@ class PaperTradingEngine:
         self.start_time = time.time()
         self.n_fills = 0
         self.n_hard_hedges = 0
+        self.recent_fills: deque[tuple[float, str, str, float, float]] = deque(maxlen=20)  # (ts, instrument, side, price, size)
+        self.update_event = asyncio.Event()  # set on every book/trade update so the dashboard can render live, not on a timer
 
     def close(self) -> None:
         if self.session_logger is not None:
@@ -144,6 +158,46 @@ class PaperTradingEngine:
             return None
         window = pd.Series(closes[-_VOL_WARMUP_UPDATES * 5:])
         return ewma_volatility(window, _VOL_HALFLIFE_SECONDS, sampling_seconds=self._bar_seconds)
+
+    def warmup_status(self, currency: str) -> tuple[str, int, int, float]:
+        """
+        (stage, bars_collected, bars_needed, eta_seconds) -- what's still
+        warming up and roughly how long until it's ready, for dashboard
+        display. Two stages: 'fast_vol' (the AS/GLFT quoting input, ready
+        after _VOL_WARMUP_UPDATES bars) then 'regime' (the slow/macro axis,
+        needs _REGIME_WARMUP_BARS -- far more history, since a 600s-halflife
+        EWMA computed from 20s of data is meaningless). 'ready' once both
+        have enough bars.
+        """
+        collected = len(self.bars[currency].closed_series()) if currency in self.bars else 0
+        if collected < _VOL_WARMUP_UPDATES:
+            needed = _VOL_WARMUP_UPDATES
+            return "fast_vol", collected, needed, (needed - collected) * self._bar_seconds
+        if collected < _REGIME_WARMUP_BARS:
+            needed = _REGIME_WARMUP_BARS
+            return "regime", collected, needed, (needed - collected) * self._bar_seconds
+        return "ready", collected, _REGIME_WARMUP_BARS, 0.0
+
+    def _regime_for(self, currency: str) -> RegimeState | None:
+        aggregator = self.bars.get(currency)
+        if aggregator is None:
+            return None
+        closes = aggregator.closed_series()
+        if len(closes) < _REGIME_WARMUP_BARS:
+            return None
+
+        window = pd.Series(closes[-_REGIME_WARMUP_BARS * 3:])
+        sigma_fast = ewma_volatility(window, _VOL_HALFLIFE_SECONDS, sampling_seconds=self._bar_seconds)
+        sigma_slow = ewma_volatility(window, _SLOW_HALFLIFE_SECONDS, sampling_seconds=self._bar_seconds)
+        drift = ema_drift(window, _DRIFT_HALFLIFE_SECONDS, sampling_seconds=self._bar_seconds)
+
+        state = RegimeState(
+            vol_regime=classify_vol_regime(sigma_fast, sigma_slow),
+            trend_regime=classify_trend_regime(drift),
+            sigma_fast=sigma_fast, sigma_slow=sigma_slow, drift=drift,
+        )
+        self.regimes[currency] = state
+        return state
 
     def _log(self, timestamp: float, event_type: str, instrument: str, data: dict) -> None:
         if self.session_logger is not None:
@@ -161,6 +215,7 @@ class PaperTradingEngine:
         elif update.key in self._quoted_options:
             self._handle_option_update(update)
         # reference streams: stored above, no quoting/fill logic
+        self.update_event.set()
 
     def _register_resting_quote(self, key: tuple[str, str, str], quote: QuoteDecision, update: OrderBookUpdate) -> None:
         instrument = update.symbol
@@ -182,6 +237,31 @@ class PaperTradingEngine:
             "bid": quote.bid_price, "ask": quote.ask_price, "bid_size": quote.bid_size, "ask_size": quote.ask_size,
         })
 
+    def _register_resting_ladder(self, key: tuple[str, str, str], ladder: LadderQuoteDecision, update: OrderBookUpdate) -> None:
+        instrument = update.symbol
+        self.resting_ladders[key] = ladder
+        self._quote_live_at[key] = self.latency_model.quote_live_at(update.timestamp, self._rng)
+
+        for i, level in enumerate(ladder.bid_levels):
+            if not ladder.skip_bid and level.size > 0.0:
+                self.queue_tracker.place_order(
+                    instrument, "bid", level.price, level.size, _size_ahead_at_price(update.bids, level.price), level=i
+                )
+            else:
+                self.queue_tracker.clear_order(instrument, "bid", level=i)
+        for i, level in enumerate(ladder.ask_levels):
+            if not ladder.skip_ask and level.size > 0.0:
+                self.queue_tracker.place_order(
+                    instrument, "ask", level.price, level.size, _size_ahead_at_price(update.asks, level.price), level=i
+                )
+            else:
+                self.queue_tracker.clear_order(instrument, "ask", level=i)
+
+        self._log(update.timestamp / 1000.0, "quote", instrument, {
+            "bid_levels": [(lvl.price, lvl.size) for lvl in ladder.bid_levels],
+            "ask_levels": [(lvl.price, lvl.size) for lvl in ladder.ask_levels],
+        })
+
     def _handle_perp_update(self, update: OrderBookUpdate) -> None:
         spec = self._quoted_perps[update.key]
 
@@ -192,25 +272,24 @@ class PaperTradingEngine:
         if sigma is None:
             return
 
+        regime = self._regime_for(spec.underlying_ccy)
+        if regime is not None:
+            self._log(update.timestamp / 1000.0, "regime", spec.underlying_ccy, {
+                "vol_regime": regime.vol_regime, "trend_regime": regime.trend_regime,
+                "sigma_fast": regime.sigma_fast, "sigma_slow": regime.sigma_slow, "drift": regime.drift,
+            })
+
         self._refresh_portfolio_greeks(spec.underlying_ccy, update)
         option_delta = self._option_delta_for(spec.underlying_ccy)
 
         position = self.position_book.position_for(_instrument_id(spec.key))
         effective_inventory = soft_hedge_inventory(position.quantity, option_delta)
 
-        state = MarketState(
-            instrument_name=update.symbol,
-            best_bid_price=update.best_bid, best_ask_price=update.best_ask,
-            best_bid_size=update.bids[0][1] if update.bids else 0.0,
-            best_ask_size=update.asks[0][1] if update.asks else 0.0,
-            mark_price=update.mid_price, index_price=update.mid_price,
-            current_funding=None, timestamp=update.timestamp,
-        )
-        quote = generate_quotes(
-            state, position, sigma, _PERP_PARAMS, _PERP_LIMITS,
+        ladder = generate_ladder_quotes(
+            update.mid_price, position, update.mid_price, sigma, _PERP_GLFT_PARAMS, _PERP_LADDER_PARAMS, _PERP_LIMITS,
             reference_price=update.microprice, inventory_override=effective_inventory,
         )
-        self._register_resting_quote(spec.key, quote, update)
+        self._register_resting_ladder(spec.key, ladder, update)
         self._maybe_hard_hedge(spec.underlying_ccy, update)
 
     def _handle_option_update(self, update: OrderBookUpdate) -> None:
@@ -251,17 +330,29 @@ class PaperTradingEngine:
             return  # our quote wasn't actually live in the book yet when this trade printed
 
         fills = self.queue_tracker.on_trade(instrument, trade["price"], trade["amount"])
-        for side, filled_size in fills:
-            quote = self.resting_quotes.get(key)
-            if quote is None:
+        for side, level, filled_size in fills:
+            price = self._resting_price_at(key, side, level)
+            if price is None:
                 continue
-            price = quote.bid_price if side == "bid" else quote.ask_price
             self.position_book.apply_fill(
                 _instrument_id(key), now_ms / 1000.0, PaperFill(side=side, price=price, size=filled_size),
             )
             self.n_fills += 1
-            self._log(now_ms / 1000.0, "fill", instrument, {"side": side, "price": price, "size": filled_size})
-            log.info("FILL  %-22s %s %.6g @ %.6g (queue/trade-tape)", instrument, side, filled_size, price)
+            self.recent_fills.append((now_ms / 1000.0, instrument, side, price, filled_size))
+            self._log(now_ms / 1000.0, "fill", instrument, {"side": side, "level": level, "price": price, "size": filled_size})
+            self.update_event.set()
+            log.info("FILL  %-22s %s L%d %.6g @ %.6g (queue/trade-tape)", instrument, side, level, filled_size, price)
+
+    def _resting_price_at(self, key: tuple[str, str, str], side: str, level: int) -> float | None:
+        """Price of a specific (side, level) quote -- ladder levels for a perp, or the single option quote (level 0)."""
+        ladder = self.resting_ladders.get(key)
+        if ladder is not None:
+            levels = ladder.bid_levels if side == "bid" else ladder.ask_levels
+            return levels[level].price if level < len(levels) else None
+        quote = self.resting_quotes.get(key)
+        if quote is not None:
+            return quote.bid_price if side == "bid" else quote.ask_price
+        return None
 
     def _key_for_instrument(self, instrument: str) -> tuple[str, str, str] | None:
         for key in self._quoted_perps:
@@ -362,25 +453,66 @@ class PaperTradingEngine:
         for key, update in self.latest_books.items():
             exchange, market_type, symbol = key
             quote = self.resting_quotes.get(key)
+            ladder = self.resting_ladders.get(key)
+            bid_levels = ask_levels = None
             if key in self._quoted_perps:
                 kind, pnl_ccy, mark = "perp-quoted", "USD", update.mid_price
+                our_bid = ladder.bid_levels[0].price if ladder and ladder.bid_levels else None
+                our_ask = ladder.ask_levels[0].price if ladder and ladder.ask_levels else None
+                if ladder is not None:
+                    bid_levels = tuple((lvl.price, lvl.size) for lvl in ladder.bid_levels)
+                    ask_levels = tuple((lvl.price, lvl.size) for lvl in ladder.ask_levels)
             elif key in self._quoted_options:
                 spec = self._quoted_options[key]
                 mark = update.mid_price  # coin-denominated, matches Position's price units for this instrument
                 kind, pnl_ccy = "option-quoted", spec.underlying_ccy
+                our_bid = quote.bid_price if quote else None
+                our_ask = quote.ask_price if quote else None
             else:
                 kind, pnl_ccy, mark = f"reference-{market_type}", "USD", update.mid_price
+                our_bid = our_ask = None
 
             instrument_id = _instrument_id(key)
             position = self.position_book.position_for(instrument_id)
+            underlying_ccy = self._quoted_perps.get(key, self._quoted_options.get(key)).underlying_ccy \
+                if key in self._quoted_perps or key in self._quoted_options else None
             rows.append(
                 InstrumentSnapshot(
                     instrument=symbol, exchange=exchange, kind=kind, mid=update.mid_price,
-                    our_bid=quote.bid_price if quote else None, our_ask=quote.ask_price if quote else None,
+                    our_bid=our_bid, our_ask=our_ask,
                     position_qty=position.quantity,
                     unrealized_pnl=position.unrealized_pnl_usd(mark),
                     pnl_ccy=pnl_ccy,
                     n_fills=sum(1 for _, sym, _ in self.position_book.fill_log if sym == instrument_id),
+                    bid_levels=bid_levels, ask_levels=ask_levels,
+                    best_bid_size=update.bids[0][1] if update.bids else None,
+                    best_ask_size=update.asks[0][1] if update.asks else None,
+                    sigma=self._sigma_for(underlying_ccy) if underlying_ccy else None,
                 )
             )
         return rows
+
+    def warmup_statuses(self) -> dict[str, tuple[str, int, int, float]]:
+        currencies = {q.underlying_ccy for q in self._quoted_perps.values()}
+        return {ccy: self.warmup_status(ccy) for ccy in currencies}
+
+    def risk_snapshots(self) -> dict[str, RiskSnapshot]:
+        """Per-currency exposure against core.risk.limits.RiskLimits and the hard-hedge delta band -- for the dashboard, not a trading decision."""
+        snapshots = {}
+        for spec in self._quoted_perps.values():
+            ccy = spec.underlying_ccy
+            update = self.latest_books.get(spec.key)
+            if update is None:
+                continue
+            position = self.position_book.position_for(_instrument_id(spec.key))
+            gross_notional = abs(position.quantity) * update.mid_price
+            delta = self.portfolio_greeks.get(ccy)
+            snapshots[ccy] = RiskSnapshot(
+                position=position.quantity, max_position=_PERP_LIMITS.max_position,
+                gross_notional_usd=gross_notional, max_gross_notional_usd=_PERP_LIMITS.max_gross_notional_usd,
+                daily_loss_usd=-min(0.0, position.net_pnl_usd(update.mid_price)),
+                max_daily_loss_usd=_PERP_LIMITS.max_daily_loss_usd,
+                portfolio_delta=delta.delta if delta else 0.0,
+                max_abs_delta=self.hard_hedge_limits.max_abs_delta,
+            )
+        return snapshots

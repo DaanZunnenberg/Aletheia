@@ -73,8 +73,8 @@ def test_queue_tracker_place_and_fill_via_walked_through_trade():
     tracker = QueueTracker()
     tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0)
     fills = tracker.on_trade("BTC-PERPETUAL", trade_price=99.0, trade_amount=1.0)
-    assert fills == [("bid", 0.1)]
-    assert ("BTC-PERPETUAL", "bid") not in tracker._orders  # cleared after fill
+    assert fills == [("bid", 0, 0.1)]
+    assert ("BTC-PERPETUAL", "bid", 0) not in tracker._orders  # cleared after fill
 
 
 def test_queue_tracker_tracks_bid_and_ask_independently():
@@ -82,9 +82,9 @@ def test_queue_tracker_tracks_bid_and_ask_independently():
     tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0)
     tracker.place_order("BTC-PERPETUAL", "ask", price=101.0, size=0.1, size_ahead=0.0)
     fills = tracker.on_trade("BTC-PERPETUAL", trade_price=99.0, trade_amount=1.0)
-    assert fills == [("bid", 0.1)]
+    assert fills == [("bid", 0, 0.1)]
     # ask should be untouched -- still present
-    assert ("BTC-PERPETUAL", "ask") in tracker._orders
+    assert ("BTC-PERPETUAL", "ask", 0) in tracker._orders
 
 
 def test_queue_tracker_ignores_trades_for_untracked_instruments():
@@ -99,7 +99,7 @@ def test_queue_tracker_requote_resets_queue_position():
     tracker.on_trade("BTC-PERPETUAL", trade_price=100.0, trade_amount=2.0)
     # requote at a new price -- should discard the old partially-drained queue state
     tracker.place_order("BTC-PERPETUAL", "bid", price=99.5, size=0.1, size_ahead=10.0)
-    order = tracker._orders[("BTC-PERPETUAL", "bid")]
+    order = tracker._orders[("BTC-PERPETUAL", "bid", 0)]
     assert order.price == 99.5
     assert order.remaining_ahead == 10.0
 
@@ -108,4 +108,43 @@ def test_queue_tracker_clear_order_removes_it():
     tracker = QueueTracker()
     tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0)
     tracker.clear_order("BTC-PERPETUAL", "bid")
-    assert ("BTC-PERPETUAL", "bid") not in tracker._orders
+    assert ("BTC-PERPETUAL", "bid", 0) not in tracker._orders
+
+
+def test_queue_tracker_multi_level_places_and_tracks_independently():
+    tracker = QueueTracker()
+    tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0, level=0)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.5, size=0.06, size_ahead=0.0, level=1)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.0, size=0.036, size_ahead=0.0, level=2)
+    assert len(tracker._orders) == 3
+
+
+def test_queue_tracker_multi_level_trade_fills_only_the_crossed_level():
+    tracker = QueueTracker()
+    tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0, level=0)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.5, size=0.06, size_ahead=0.0, level=1)
+    # trade at 99.7: walks through level 0 (100.0) but not level 1 (99.5)
+    fills = tracker.on_trade("BTC-PERPETUAL", trade_price=99.7, trade_amount=1.0)
+    assert fills == [("bid", 0, 0.1)]
+    assert ("BTC-PERPETUAL", "bid", 1) in tracker._orders  # untouched
+
+
+def test_queue_tracker_multi_level_deep_trade_fills_every_shallower_level():
+    tracker = QueueTracker()
+    tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0, level=0)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.5, size=0.06, size_ahead=0.0, level=1)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.0, size=0.036, size_ahead=0.0, level=2)
+    # trade at 98.0 walks through all three levels
+    fills = tracker.on_trade("BTC-PERPETUAL", trade_price=98.0, trade_amount=1.0)
+    assert {(side, level) for side, level, _ in fills} == {("bid", 0), ("bid", 1), ("bid", 2)}
+
+
+def test_queue_tracker_clear_side_removes_all_levels_for_that_side_only():
+    tracker = QueueTracker()
+    tracker.place_order("BTC-PERPETUAL", "bid", price=100.0, size=0.1, size_ahead=0.0, level=0)
+    tracker.place_order("BTC-PERPETUAL", "bid", price=99.5, size=0.06, size_ahead=0.0, level=1)
+    tracker.place_order("BTC-PERPETUAL", "ask", price=101.0, size=0.1, size_ahead=0.0, level=0)
+    tracker.clear_side("BTC-PERPETUAL", "bid")
+    assert ("BTC-PERPETUAL", "bid", 0) not in tracker._orders
+    assert ("BTC-PERPETUAL", "bid", 1) not in tracker._orders
+    assert ("BTC-PERPETUAL", "ask", 0) in tracker._orders
