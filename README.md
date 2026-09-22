@@ -1,7 +1,7 @@
 # Aletheia
 
 Crypto perpetual market-making framework. Quotes both sides of the book on
-BTC/ETH perpetuals, managing inventory risk with closed-form quoting models
+BTC/ETH options, managing inventory risk with closed-form quoting models
 (Avellaneda-Stoikov, GLFT) and regime/toxicity-aware gating, backtested
 against real exchange data.
 
