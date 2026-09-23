@@ -11,6 +11,7 @@ class PaperFill:
     side: str  # 'bid' | 'ask'
     price: float
     size: float
+    liquidity: str = "maker"  # 'maker' | 'taker' -- resting quote hit vs. crossing the book ourselves
 
 
 def check_fill(resting_quote: QuoteDecision, book: OrderBookUpdate) -> list[PaperFill]:

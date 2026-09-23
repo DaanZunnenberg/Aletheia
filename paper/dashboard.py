@@ -75,6 +75,13 @@ class InstrumentSnapshot:
     realized_vol: float | None = None   # RV fed into the quote, core.models.volatility.ewma_volatility
     fair_vol: float | None = None       # IV we actually quote at -- realized_vol * VRP_MULTIPLIER (paper/option_quoting.py)
     theo_price: float | None = None     # Black-76 mid at fair_vol, coin-denominated (comparable to `mid`)
+    # Firm P&L/position detail -- same units as unrealized_pnl (pnl_ccy):
+    realized_pnl: float = 0.0
+    fees_paid: float = 0.0
+    funding_paid: float = 0.0           # perps only; always 0.0 for options (no funding leg)
+    n_maker_fills: int = 0
+    n_taker_fills: int = 0
+    position_age_seconds: float | None = None  # time since the current directional stance began; None if flat
 
 
 @dataclass(frozen=True)
@@ -87,6 +94,27 @@ class RiskSnapshot:
     max_daily_loss_usd: float
     portfolio_delta: float
     max_abs_delta: float
+
+
+@dataclass(frozen=True)
+class PortfolioSummary:
+    """
+    Per-underlying-currency P&L rollup across every instrument quoting that
+    currency (perp + options), converted to a common USD basis (option P&L
+    is coin-denominated at the position level -- see InstrumentSnapshot --
+    but rolls up here in USD via the underlying's own mark price, since a
+    portfolio total mixing units silently would be worse than not showing one).
+    """
+    realized_pnl_usd: float
+    unrealized_pnl_usd: float
+    fees_paid_usd: float
+    funding_paid_usd: float
+    net_pnl_usd: float
+    gross_notional_usd: float
+    n_maker_fills: int
+    n_taker_fills: int
+    high_water_mark_usd: float
+    drawdown_usd: float  # >= 0.0, distance below the running high-water mark
 
 
 def utilization(value: float, limit: float) -> float:
@@ -123,6 +151,17 @@ def _fmt_coin_price(x: float | None) -> str:
 
 def _fmt_size(x: float | None) -> str:
     return "--" if x is None else f"{x:,.4f}"
+
+
+def _fmt_age(seconds: float | None) -> str:
+    """Compact position-age label -- flat shows '--', else Ns/Nm/Nh."""
+    if seconds is None:
+        return "--"
+    if seconds < 60.0:
+        return f"{seconds:.0f}s"
+    if seconds < 3600.0:
+        return f"{seconds / 60.0:.0f}m"
+    return f"{seconds / 3600.0:.1f}h"
 
 
 class MarketDashboard:
@@ -174,6 +213,25 @@ class MarketDashboard:
             text.append("  Delta --  Gamma --  Vega --  Theta --", style=base)
         return text
 
+    def _render_pnl_line(self, ccy: str, summary: "PortfolioSummary | None", dim: bool = False) -> Text:
+        text = Text()
+        base = "dim" if dim else ""
+        text.append(f"{ccy} PnL  ", style="bold" if not dim else "bold dim")
+        if summary is None:
+            text.append("--", style=base)
+            return text
+        net_style = "" if dim else (_GREEN if summary.net_pnl_usd > 0 else (_RED if summary.net_pnl_usd < 0 else ""))
+        text.append(f"net {summary.net_pnl_usd:+,.2f}", style=net_style)
+        text.append(
+            f"  (real {summary.realized_pnl_usd:+,.2f}  unreal {summary.unrealized_pnl_usd:+,.2f}"
+            f"  fees {summary.fees_paid_usd:,.2f}  funding {summary.funding_paid_usd:+,.2f})",
+            style=base,
+        )
+        text.append(f"  fills {summary.n_maker_fills}mk/{summary.n_taker_fills}tk", style=base)
+        dd_style = "" if dim else ("bold yellow" if summary.drawdown_usd > 0.0 else "")
+        text.append(f"  HWM {summary.high_water_mark_usd:,.2f}  DD -{summary.drawdown_usd:,.2f}", style=dd_style or base)
+        return text
+
     def _position_cell(self, s: InstrumentSnapshot, risk_snapshots: dict, ccy: str) -> Text:
         r = risk_snapshots.get(ccy)
         if s.kind == "perp-quoted" and r is not None:
@@ -191,21 +249,22 @@ class MarketDashboard:
         # Explicit no_wrap width per column -- rather than autosized headers,
         # which wrap to two lines at different points for the perp vs. option
         # table and throw the two tables' rows out of vertical alignment.
-        table = Table(title=f"{ccy} Perp OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False)
+        table = Table(title=f"{ccy} Perp OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False, padding=(0, 0))
         for col, justify, width in [
             ("Instrument", "left", 12), ("OurBid", "right", 9), ("OurAsk", "right", 9), ("BookBid", "right", 9),
             ("BookAsk", "right", 9), ("Spread", "right", 6), ("Mid", "right", 9), ("Position", "right", 8),
-            ("Fills", "right", 5), ("uPnL", "right", 11),
+            ("Age", "right", 5), ("M/T", "right", 6), ("RPnL", "right", 9), ("uPnL", "right", 9),
         ]:
             table.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis" if col == "Instrument" else "crop")
 
         rows = [s for s in snapshots if s.instrument.startswith(ccy) and s.kind == "perp-quoted"]
         if not rows:
-            table.add_row("--", *([""] * 9))
+            table.add_row("--", *([""] * 11))
             return table
 
         for s in rows:
             pnl_style = _GREEN if s.unrealized_pnl > 0 else (_RED if s.unrealized_pnl < 0 else "")
+            rpnl_style = _GREEN if s.realized_pnl > 0 else (_RED if s.realized_pnl < 0 else "")
             book_bid = s.book_bids[0][0] if s.book_bids else None
             book_ask = s.book_asks[0][0] if s.book_asks else None
             bps = spread_bps(book_bid, book_ask, s.mid)
@@ -216,8 +275,10 @@ class MarketDashboard:
                 Text(_fmt_price(book_bid), style=_GREEN if book_bid is not None else ""),
                 Text(_fmt_price(book_ask), style=_RED if book_ask is not None else ""),
                 "--" if bps is None else f"{bps:,.1f}",
-                _fmt_price(s.mid), self._position_cell(s, risk_snapshots, ccy), str(s.n_fills),
-                Text(f"{s.unrealized_pnl:+.4f}{s.pnl_ccy}", style=pnl_style),
+                _fmt_price(s.mid), self._position_cell(s, risk_snapshots, ccy),
+                _fmt_age(s.position_age_seconds), f"{s.n_maker_fills}/{s.n_taker_fills}",
+                Text(f"{s.realized_pnl:+.2f}", style=rpnl_style),
+                Text(f"{s.unrealized_pnl:+.2f}", style=pnl_style),
             )
         return table
 
@@ -229,21 +290,23 @@ class MarketDashboard:
         # them, and our Black-76 theoretical price vs. the market's own
         # mid. A different instrument/book entirely, updates independently
         # of the perp table above.
-        table = Table(title=f"{ccy} Option OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False)
+        table = Table(title=f"{ccy} Option OB", expand=True, box=box.SIMPLE_HEAVY, header_style="bold", pad_edge=False, padding=(0, 0))
         for col, justify, width in [
             ("Instrument", "left", 14), ("OurBid", "right", 7), ("OurAsk", "right", 7), ("Mid", "right", 7),
-            ("Position", "right", 8), ("Fills", "right", 5), ("uPnL", "right", 11),
+            ("Position", "right", 8), ("Age", "right", 6), ("M/T", "right", 7),
+            ("RPnL", "right", 9), ("uPnL", "right", 9),
             ("RVol", "right", 6), ("IVol", "right", 6), ("VRP", "right", 7), ("Theo", "right", 8),
         ]:
             table.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis" if col == "Instrument" else "crop")
 
         rows = [s for s in snapshots if s.instrument.startswith(ccy) and s.kind == "option-quoted"]
         if not rows:
-            table.add_row("--", *([""] * 10))
+            table.add_row("--", *([""] * 11))
             return table
 
         for s in rows:
             pnl_style = _GREEN if s.unrealized_pnl > 0 else (_RED if s.unrealized_pnl < 0 else "")
+            rpnl_style = _GREEN if s.realized_pnl > 0 else (_RED if s.realized_pnl < 0 else "")
 
             if s.fair_vol is not None and s.realized_vol is not None:
                 vrp_edge = s.fair_vol - s.realized_vol
@@ -264,8 +327,10 @@ class MarketDashboard:
                 s.instrument,
                 Text(_fmt_coin_price(s.our_bid), style=_GREEN if s.our_bid is not None else ""),
                 Text(_fmt_coin_price(s.our_ask), style=_RED if s.our_ask is not None else ""),
-                _fmt_coin_price(s.mid), self._position_cell(s, risk_snapshots, ccy), str(s.n_fills),
-                Text(f"{s.unrealized_pnl:+.4f}{s.pnl_ccy}", style=pnl_style),
+                _fmt_coin_price(s.mid), self._position_cell(s, risk_snapshots, ccy),
+                _fmt_age(s.position_age_seconds), f"{s.n_maker_fills}/{s.n_taker_fills}",
+                Text(f"{s.realized_pnl:+.4f}", style=rpnl_style),
+                Text(f"{s.unrealized_pnl:+.4f}", style=pnl_style),
                 realized_vol_cell, fair_vol_cell, edge_text, theo_cell,
             )
         return table
@@ -315,12 +380,16 @@ class MarketDashboard:
         warmup_statuses: dict[str, tuple[str, int, int, float]] | None = None,
         risk_snapshots: dict | None = None,
         event_log: list[BlotterRow] | None = None,
+        portfolio_summaries: dict | None = None,
     ) -> Group:
-        portfolio_greeks, regimes, warmup_statuses, risk_snapshots = (
-            portfolio_greeks or {}, regimes or {}, warmup_statuses or {}, risk_snapshots or {}
+        portfolio_greeks, regimes, warmup_statuses, risk_snapshots, portfolio_summaries = (
+            portfolio_greeks or {}, regimes or {}, warmup_statuses or {}, risk_snapshots or {}, portfolio_summaries or {}
         )
         ccy = self._PRIMARY_CCY
-        other_ccys = sorted((set(risk_snapshots) | set(regimes) | set(warmup_statuses) | set(portfolio_greeks)) - {ccy})
+        other_ccys = sorted(
+            (set(risk_snapshots) | set(regimes) | set(warmup_statuses) | set(portfolio_greeks) | set(portfolio_summaries))
+            - {ccy}
+        )
 
         title = Text.assemble(
             ("ALETHEIA PAPER TRADING FLOOR", "bold"), ("  --  DRY RUN, NO REAL ORDERS  ", "bold red"),
@@ -329,10 +398,14 @@ class MarketDashboard:
             (f"  hard hedges {n_hard_hedges}", "bold yellow" if n_hard_hedges else "dim"),
             "\n",
             self._render_status_line(ccy, regimes.get(ccy), warmup_statuses.get(ccy), portfolio_greeks.get(ccy)),
+            "\n",
+            self._render_pnl_line(ccy, portfolio_summaries.get(ccy)),
         )
         for other in other_ccys:
             title.append("\n")
             title.append(self._render_status_line(other, regimes.get(other), warmup_statuses.get(other), portfolio_greeks.get(other), dim=True))
+            title.append("\n")
+            title.append(self._render_pnl_line(other, portfolio_summaries.get(other), dim=True))
 
         header = Panel(title, box=box.HEAVY, border_style="dim", padding=(0, 1))
         perp_table = self._render_perp_table(ccy, snapshots, risk_snapshots)

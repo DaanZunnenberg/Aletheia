@@ -16,9 +16,11 @@ material (`core/MODEL.md`); this file only documents the public layer.
 ```
 aletheia/                       ← public repo
 ├── data/           ← OrderBookUpdate (exchange-agnostic L2 book type)
-├── exchanges/       ← live L2 order-book connectors + stream manager
+├── exchanges/       ← live L2 order-book connectors + stream manager (hand-rolled, per-exchange)
+├── ccxt_stream/     ← live L2/trade connectors via ccxt.pro (exchange-agnostic, alternative to exchanges/)
 ├── deribit/         ← Deribit REST client (historical trades, instruments)
 ├── paper/           ← paper trading engine (fills, positions, dashboard) -- orchestration, not model logic
+├── backtest_cli/    ← terminal replay viewer for a backtest, paper-floor-style -- orchestration, not model logic
 ├── examples/        ← runnable demos
 ├── tests/           ← tests for the public layer
 ├── utils/           ← dependency-free helpers (logger)
@@ -34,6 +36,7 @@ aletheia/                       ← public repo
 | File | Purpose | Status |
 |------|---------|--------|
 | `data/orderbook.py` | `OrderBookUpdate` — exchange-agnostic L2 snapshot every connector normalises into. `best_bid`/`best_ask`/`mid_price`/`microprice` (size-weighted mid, Stoikov 2018)/`key` convenience properties. `market_type` includes `"option"` | active |
+| `data/recorder.py` | `StreamRecorder` — append-only JSONL writer for raw live `OrderBookUpdate`/`deribit.types.Trade` events, exactly as received from `exchanges/`, before any strategy logic. Deribit has no historical L2 endpoint, so this is the only way to accumulate real order-book depth for backtesting — recording forward from now, not retroactively. Fed by `examples/record_live_streams.py`; replayed by `core/backtest/l2_replay.py` | active |
 
 ---
 
@@ -46,6 +49,19 @@ aletheia/                       ← public repo
 | `exchanges/binance_connector.py` | `BinanceOrderBookConnector(market_type)` — multi-symbol L2 streaming over one combined-stream WS connection, for `spot` or `perpetual` (separate hosts). Uses the partial book depth stream (`<symbol>@depth<5\|10\|20>@100ms`) — a ready top-N snapshot per update, not a diff stream requiring local state reconstruction. Spot and futures use different JSON key names for the same data (`bids`/`asks` vs. `b`/`a`); handled transparently | active |
 | `exchanges/stream_manager.py` | `MultiExchangeStreamManager`, `StreamSpec` — runs an arbitrary number of connectors concurrently (one asyncio task each), merges into a single async stream via a shared queue. A connector task dying is caught and logged, not propagated, so one dead stream doesn't take down the others | active |
 | `exchanges/deribit_trades.py` | `DeribitTradeStreamConnector` — multi-instrument live trade stream (same multi-channel-over-one-WS pattern as the order-book connector), yielding `deribit.types.Trade`. Feeds `paper/queue_tracker.py`'s trade-tape-driven fills — replaces the earlier L2-crossing fill approximation | active |
+
+---
+
+## ccxt_stream/
+
+Live data via [ccxt.pro](https://github.com/ccxt/ccxt) (free WebSocket streaming, merged into the main `ccxt` package since v4) instead of the hand-rolled `exchanges/` connectors — one exchange-agnostic class covers any ccxt.pro-supported venue, at the cost of venue-specific tuning (e.g. Deribit's own `change_id` gap detection) the hand-rolled connectors have. Produces the exact same `data.orderbook.OrderBookUpdate` / `data/recorder.py` JSONL schema, so recordings are interchangeable with `examples/record_live_streams.py`'s and replay unchanged through `core/backtest/l2_replay.py`.
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `ccxt_stream/connector.py` | `CCXTOrderBookConnector(exchange_id, market_type, depth)` — implements `exchanges.base.OrderBookConnector`'s protocol via `ccxt.pro`'s `watch_order_book_for_symbols`, so it's a drop-in `StreamSpec.connector` for `exchanges.stream_manager.MultiExchangeStreamManager` too. Requests the smallest valid ccxt depth ≥ the caller's request (Binance futures only accepts 5/10/20/50/100/500/1000 — 25 is rejected) and truncates down to exactly what was asked for | active |
+| `ccxt_stream/trades.py` | `CCXTTradeStreamConnector`, `CCXTTrade` — ccxt.pro analogue of `exchanges/deribit_trades.py`, generalised to any venue. `CCXTTrade` has the same field names as `deribit.types.Trade` so recordings are replay-compatible without format-specific branching | active |
+| `ccxt_stream/select_option.py` | `select_near_1dte_option()` — nearest-to-1-day-to-expiry, nearest-the-money Deribit call, via ccxt REST. Binance discontinued its options market in 2024 (verified live: zero option markets listed) so Deribit — already this project's real options venue per CLAUDE.md — is the only live source for "1DTE options" data | active |
+| `ccxt_stream/record.py` | Runnable recorder: 25-level Binance USDT-M perpetual (BTC, ETH) depth + trades, and the selected Deribit 1DTE BTC/ETH option depth + trades (whatever depth actually rests — thin option books often have fewer than 25 real levels). Writes to `runtime/ccxt_recordings/*.jsonl` via `data/recorder.py`. Run: `python ccxt_stream/record.py [seconds]` | active |
 
 ---
 
@@ -82,6 +98,17 @@ lives in the public repo, not `core/`.
 
 ---
 
+## backtest_cli/
+
+Terminal replay viewer for a `BacktestResult` -- the paper-trading-floor look (`paper/dashboard.py`) applied to a backtest instead of a live session. Post-hoc replay, not a live view: `core.backtest.l2_replay`/`core.backtest.historical` compute the full result before returning, so this runs the backtest once then plays `BacktestResult.history` back one bar at a time at a configurable speed.
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `backtest_cli/dashboard.py` | `BacktestDashboard`, `BacktestRunInfo`, `BlotterRow` — single-instrument replay view: header (source recording/CSV, params, bar progress, running Sharpe/drawdown/turnover/breach-rate), a one-row current-state table (mid/our quote/inventory/P&L breakdown/breach), and a scrolling "Fills" blotter derived by diffing `inventory` between consecutive history rows (`BacktestResult.history` has no per-fill log, only per-bar snapshots). Same visual convention as `paper/dashboard.py`: plain text, green/red only for buy/sell and profit/loss | active |
+| `backtest_cli/run.py` | Runnable: `python backtest_cli/run.py {l2\|historical} <path> [--gamma G] [--kappa K] [--speed N]`. Runs `core.backtest.l2_replay.run_l2_replay_backtest` or `core.backtest.historical.run_historical_ladder_backtest` once, then replays via `rich.Live`. `_RunningMetrics` is a from-scratch O(1)-per-bar reimplementation of `core.backtest.metrics.summarize()` (recomputing summarize on a growing slice every frame is O(n²) over a full replay -- both real recordings on hand are ~64k bars, which would stall the first frame for minutes); render rate is capped at ~20fps independent of `--speed` so skimming a long recording at high speed doesn't make rich rendering the bottleneck | active |
+
+---
+
 ## examples/
 
 | File | Purpose | Status |
@@ -89,6 +116,7 @@ lives in the public repo, not `core/`.
 | `examples/stream_multi_exchange_books.py` | Streams 6 concurrent L2 books (BTC/ETH x {Deribit perp, Binance perp, Binance spot}) via `MultiExchangeStreamManager`, logs final mid/update-count per stream. Proves multi-exchange, multi-coin, spot+perp concurrent streaming in one process | active |
 | `examples/live_quote_loop.py` | First end-to-end live quoting loop: real Deribit L2 book → EWMA vol → `core.strategies.market_maker.generate_quotes` (Avellaneda-Stoikov) → printed bid/ask. Wires in `core.risk.tail_risk.TailRiskMonitor`. Dry-run only — no order placement, `mark_price`/`index_price` approximated by live mid (no ticker/funding stream wired in yet) | active |
 | `examples/paper_trading_bot.py` | Live paper trading bot (`paper/`): Deribit perp + nearest-ATM option per coin (quoted, both books AND trades streamed), Binance spot + perpetual (reference-only), refreshing terminal dashboard with portfolio Greeks, session logged to `runtime/paper_sessions/*.jsonl`, dry-run. Validated live against all four venues/market types including a real near-0DTE option (~2.3h to expiry) | active |
+| `examples/record_live_streams.py` | Pure recorder, no quoting: streams real Deribit perp L2 + trades and Binance spot/perp L2 via `MultiExchangeStreamManager`, persists every event via `data/recorder.py` to `runtime/recordings/*.jsonl`. Run unattended to accumulate a real-L2 dataset for `core/backtest/l2_replay.py` | active |
 
 ---
 
@@ -97,6 +125,8 @@ lives in the public repo, not `core/`.
 | File | Purpose | Status |
 |------|---------|--------|
 | `tests/test_orderbook.py` | pytest coverage for `data/orderbook.py`: best bid/ask, mid price, microprice (symmetric/imbalanced/empty-book), key identity, immutability | active |
+| `tests/test_ccxt_stream.py` | pytest coverage for `ccxt_stream/`: depth-rounding to a valid ccxt limit then truncation, 1DTE-option selection (nearest to target hours, not soonest; nearest strike at the chosen expiry; raises when no options exist) — offline, against fake market data, no network | active |
+| `tests/test_backtest_cli.py` | pytest coverage for `backtest_cli/`: `_RunningMetrics`' O(1)-per-bar stats verified bar-by-bar against `core.backtest.metrics.summarize()`'s batch calculation on the same synthetic history (caught a real turnover double-count bug on the first bar before it shipped), dashboard renders without error | active |
 | `tests/test_stream_manager.py` | pytest coverage for `exchanges/stream_manager.py` against fake (non-network) connectors: multi-connector merging, clean shutdown, one connector dying doesn't crash the manager | active |
 | `tests/test_fill_simulator.py` | pytest coverage for `paper/fill_simulator.py`: crossing conditions both sides, skip flags, zero size | active |
 | `tests/test_queue_tracker.py` | pytest coverage for `paper/queue_tracker.py`: walk-through fills, queue-ahead consumption, multi-trade progressive draining, per-instrument/per-side independence | active |

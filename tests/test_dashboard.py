@@ -160,11 +160,11 @@ def test_market_dashboard_perp_and_option_are_separate_tables_each_with_only_the
     assert option_table.row_count == 1
     assert [c.header for c in perp_table.columns] == [
         "Instrument", "OurBid", "OurAsk", "BookBid", "BookAsk", "Spread",
-        "Mid", "Position", "Fills", "uPnL",
+        "Mid", "Position", "Age", "M/T", "RPnL", "uPnL",
     ]
     assert [c.header for c in option_table.columns] == [
-        "Instrument", "OurBid", "OurAsk", "Mid", "Position", "Fills",
-        "uPnL", "RVol", "IVol", "VRP", "Theo",
+        "Instrument", "OurBid", "OurAsk", "Mid", "Position", "Age", "M/T",
+        "RPnL", "uPnL", "RVol", "IVol", "VRP", "Theo",
     ]
 
 
@@ -275,12 +275,12 @@ def test_market_dashboard_header_includes_a_dim_eth_reference_line():
 def test_market_dashboard_book_table_position_from_risk_snapshot_for_perp():
     dashboard = MarketDashboard()
     text = _rendered_text(dashboard.render(
-        [_snap(n_fills=7)], 1.0, 0,
+        [_snap(n_maker_fills=5, n_taker_fills=2)], 1.0, 0,
         risk_snapshots={"BTC": _risk(position=0.3, max_position=1.5)},
         warmup_statuses={"BTC": ("ready", 300, 300, 0.0)},
     ))
     assert "0.3000" in text
-    assert "7" in text  # fill count
+    assert "5/2" in text  # maker/taker fill counts
 
 
 def test_market_dashboard_perp_table_pnl_colored_green_when_positive_red_when_negative():

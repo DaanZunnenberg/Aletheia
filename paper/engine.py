@@ -25,7 +25,7 @@ from core.strategies.market_maker import QuoteDecision
 from data.orderbook import OrderBookUpdate
 from deribit.types import Trade
 from paper.bar_builder import LiveBarAggregator
-from paper.dashboard import BlotterRow, InstrumentSnapshot, RiskSnapshot
+from paper.dashboard import BlotterRow, InstrumentSnapshot, PortfolioSummary, RiskSnapshot
 from paper.execution_latency import LatencyModel, is_quote_live
 from paper.execution_latency import taker_slippage_price
 from paper.fill_simulator import PaperFill
@@ -44,7 +44,18 @@ _SLOW_HALFLIFE_SECONDS = 600.0      # "macro" slow vol estimate -- 10 min halfli
 _DRIFT_HALFLIFE_SECONDS = 900.0     # macro trend EMA -- 15 min halflife
 _REGIME_WARMUP_BARS = 300           # bars before the slow/macro regime axis is trusted (5 min at 1s bars) --
                                      # a 600s-halflife EWMA computed from 20s of data is meaningless noise, not a baseline
-_PERP_GLFT_PARAMS = GLFTParams(gamma=5.0, kappa=1.5, A=0.05, q_max=1.0)
+# gamma=20.0 (risk aversion) is calibrated, not hand-picked: purged
+# walk-forward on a real recorded L2 BTC-PERPETUAL book (queue-position-
+# aware fills, core/backtest/l2_replay.py + core/backtest/walk_forward.py's
+# walk_forward_calibrate_l2, grid {1, 2.5, 5, 10, 20}) selected gamma=20 on
+# every one of 5 out-of-sample folds against
+# runtime/recordings/20260921T140550.jsonl (see
+# research/l2_walk_forward_demo.py) -- consistent across folds, unlike the
+# single-day trade-tape calibration (research/walk_forward_calibration_demo.py),
+# which picked a different gamma per fold on that data. Re-run against a
+# fresh recording periodically -- one recording is still one regime sample,
+# not a robust long-run fit (see CLAUDE.md's overfitting-risk note).
+_PERP_GLFT_PARAMS = GLFTParams(gamma=20.0, kappa=1.5, A=0.05, q_max=1.0)
 _PERP_LADDER_PARAMS = LadderParams(n_levels=3, intensity_decay_per_level=0.5, size_decay_per_level=0.6)
 _PERP_LIMITS = RiskLimits()
 _SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
@@ -56,6 +67,18 @@ _OB_DEPTH_LEVELS_SHOWN = 5  # top-of-book depth surfaced to the dashboard, real 
 # taker. Not pulled from a live fee-tier API -- flat, conservative estimate.
 _MAKER_FEE_BPS = 0.0
 _TAKER_FEE_BPS = 5.0
+
+# Perpetual funding accrual. Deribit streams a live rate on the
+# perpetual.{instrument}.{interval} ticker channel (see deribit/types.py
+# PerpetualTickerData.current_funding) but nothing in exchanges/ subscribes
+# to it yet -- only OrderBookUpdate/Trade flow into this engine. Until that
+# feed is wired in, funding is accrued continuously (pro-rated by elapsed
+# wall-clock seconds, standard 8h-rate convention) using a static estimate
+# so the mechanism -- and its effect on P&L -- is real and testable now,
+# not a rounding error deferred to "later". A positive rate means longs pay
+# shorts, matching Deribit's convention.
+_FUNDING_RATE_8H_ESTIMATE = 0.0001  # 1bp/8h placeholder, replace with the live ticker rate once wired
+_FUNDING_INTERVAL_SECONDS = 8.0 * 3600.0
 
 
 def _instrument_id(key: tuple[str, str, str]) -> str:
@@ -184,6 +207,27 @@ class PaperTradingEngine:
         self.n_hard_hedges = 0
         self.event_log: deque[BlotterRow] = deque(maxlen=500)  # dashboard tape, one fixed-schema row per event
         self.update_event = asyncio.Event()  # set on every book/trade update so the dashboard can render live, not on a timer
+
+        self._last_funding_accrual: dict[str, float] = {}  # instrument_id -> last accrual timestamp (seconds)
+        self._high_water_mark_usd: dict[str, float] = {}   # underlying ccy -> running peak of net_pnl_usd
+
+    def _accrue_funding(self, spec: QuotedPerp, update: OrderBookUpdate) -> None:
+        instrument_id = _instrument_id(spec.key)
+        now = update.timestamp / 1000.0
+        last = self._last_funding_accrual.get(instrument_id)
+        self._last_funding_accrual[instrument_id] = now
+        if last is None:
+            return  # nothing to pro-rate against on the first tick
+        elapsed = now - last
+        if elapsed <= 0.0:
+            return
+        position = self.position_book.position_for(instrument_id)
+        if position.quantity == 0.0:
+            return
+        funding_payment = (
+            position.quantity * update.mid_price * _FUNDING_RATE_8H_ESTIMATE * (elapsed / _FUNDING_INTERVAL_SECONDS)
+        )
+        self.position_book.accrue_funding(instrument_id, funding_payment)
 
     def close(self) -> None:
         if self.session_logger is not None:
@@ -329,6 +373,7 @@ class PaperTradingEngine:
             })
 
         self._refresh_portfolio_greeks(spec.underlying_ccy, update)
+        self._accrue_funding(spec, update)
         option_delta = self._option_delta_for(spec.underlying_ccy)
 
         position = self.position_book.position_for(_instrument_id(spec.key))
@@ -384,7 +429,7 @@ class PaperTradingEngine:
             if price is None:
                 continue
             self.position_book.apply_fill(
-                _instrument_id(key), now_ms / 1000.0, PaperFill(side=side, price=price, size=filled_size),
+                _instrument_id(key), now_ms / 1000.0, PaperFill(side=side, price=price, size=filled_size, liquidity="maker"),
             )
             # Maker fill: we were the resting order, filled exactly at our quoted
             # price -- no execution slippage, just the (typically zero/rebate) maker fee.
@@ -492,7 +537,7 @@ class PaperTradingEngine:
         depth = perp_book.bids[0][1] if side == "sell" else (perp_book.asks[0][1] if perp_book.asks else 1.0)
         exec_price = taker_slippage_price(perp_book.mid_price, side, abs(hedge_qty), depth)
 
-        fill = PaperFill(side="bid" if hedge_qty > 0 else "ask", price=exec_price, size=abs(hedge_qty))
+        fill = PaperFill(side="bid" if hedge_qty > 0 else "ask", price=exec_price, size=abs(hedge_qty), liquidity="taker")
         position = self.position_book.position_for(_instrument_id(perp_key))
         self.position_book.apply_fill(_instrument_id(perp_key), update.timestamp / 1000.0, fill)
         # Taker fill: crosses the book, so it pays the taker fee and eats the
@@ -567,9 +612,77 @@ class PaperTradingEngine:
                     book_bids=update.bids[:_OB_DEPTH_LEVELS_SHOWN],
                     book_asks=update.asks[:_OB_DEPTH_LEVELS_SHOWN],
                     realized_vol=realized_vol, fair_vol=fair_vol, theo_price=theo_price,
+                    realized_pnl=position.realized_pnl_usd,
+                    fees_paid=position.fees_paid_usd,
+                    funding_paid=position.funding_paid_usd,
+                    n_maker_fills=self.position_book.maker_fill_count.get(instrument_id, 0),
+                    n_taker_fills=self.position_book.taker_fill_count.get(instrument_id, 0),
+                    position_age_seconds=self.position_book.position_age_seconds(instrument_id, update.timestamp / 1000.0),
                 )
             )
         return rows
+
+    def portfolio_summaries(self) -> dict[str, PortfolioSummary]:
+        """
+        One PortfolioSummary per underlying currency, rolling up every
+        instrument quoting it (perp + options) onto a common USD basis and
+        tracking a running high-water mark / drawdown against it.
+        """
+        currencies = {q.underlying_ccy for q in self._quoted_perps.values()} | \
+            {q.underlying_ccy for q in self._quoted_options.values()}
+        summaries: dict[str, PortfolioSummary] = {}
+        for ccy in currencies:
+            realized = unrealized = fees = funding = gross_notional = 0.0
+            n_maker = n_taker = 0
+
+            for spec in self._quoted_perps.values():
+                if spec.underlying_ccy != ccy:
+                    continue
+                update = self.latest_books.get(spec.key)
+                if update is None:
+                    continue
+                instrument_id = _instrument_id(spec.key)
+                position = self.position_book.position_for(instrument_id)
+                realized += position.realized_pnl_usd
+                unrealized += position.unrealized_pnl_usd(update.mid_price)
+                fees += position.fees_paid_usd
+                funding += position.funding_paid_usd
+                gross_notional += abs(position.quantity) * update.mid_price
+                n_maker += self.position_book.maker_fill_count.get(instrument_id, 0)
+                n_taker += self.position_book.taker_fill_count.get(instrument_id, 0)
+
+            for spec in self._quoted_options.values():
+                if spec.underlying_ccy != ccy:
+                    continue
+                underlying_book = self.latest_books.get(spec.underlying_key)
+                option_book = self.latest_books.get(spec.key)
+                if underlying_book is None or option_book is None:
+                    continue
+                instrument_id = _instrument_id(spec.key)
+                position = self.position_book.position_for(instrument_id)
+                # Option P&L/fees/funding accumulate coin-denominated (see
+                # PositionBook docstring) -- convert to USD via the
+                # underlying's own mark so the rollup is a single, honest unit.
+                underlying_mark = underlying_book.microprice
+                realized += position.realized_pnl_usd * underlying_mark
+                unrealized += position.unrealized_pnl_usd(option_book.mid_price) * underlying_mark
+                fees += position.fees_paid_usd * underlying_mark
+                funding += position.funding_paid_usd * underlying_mark
+                gross_notional += abs(position.quantity) * option_book.mid_price * underlying_mark
+                n_maker += self.position_book.maker_fill_count.get(instrument_id, 0)
+                n_taker += self.position_book.taker_fill_count.get(instrument_id, 0)
+
+            net_pnl = realized + unrealized - fees - funding
+            peak = max(self._high_water_mark_usd.get(ccy, net_pnl), net_pnl)
+            self._high_water_mark_usd[ccy] = peak
+
+            summaries[ccy] = PortfolioSummary(
+                realized_pnl_usd=realized, unrealized_pnl_usd=unrealized,
+                fees_paid_usd=fees, funding_paid_usd=funding, net_pnl_usd=net_pnl,
+                gross_notional_usd=gross_notional, n_maker_fills=n_maker, n_taker_fills=n_taker,
+                high_water_mark_usd=peak, drawdown_usd=max(peak - net_pnl, 0.0),
+            )
+        return summaries
 
     def warmup_statuses(self) -> dict[str, tuple[str, int, int, float]]:
         currencies = {q.underlying_ccy for q in self._quoted_perps.values()}
