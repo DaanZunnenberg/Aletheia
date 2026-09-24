@@ -30,6 +30,11 @@ class _FakeMarket:
     expiry: float
     strike: float
     symbol: str
+    settle: str = None
+
+    def __post_init__(self) -> None:
+        if self.settle is None:
+            self.settle = self.base
 
     def get(self, key, default=None):
         return getattr(self, key, default)
@@ -77,3 +82,35 @@ def test_select_near_1dte_option_picks_nearest_strike_at_the_chosen_expiry():
 def test_select_near_1dte_option_raises_when_no_live_options_exist():
     with pytest.raises(ValueError):
         select_near_1dte_option(_FakeDeribit({}), "BTC", spot_price=80_000.0)
+
+
+def test_select_near_1dte_option_ignores_usdc_settled_markets():
+    # Deribit lists both coin-settled (settle=="BTC") and USDC-settled
+    # options on the same strike/expiry -- picking up both would double
+    # up "distinct" strikes with near-duplicate instruments. Only the
+    # coin-settled market matches this project's inverse-option convention
+    # (paper/option_quoting.py divides the Black-76 USD price by spot).
+    import time
+    now_ms = time.time() * 1000.0
+    hour = 3600_000.0
+    markets = {
+        "usdc": _FakeMarket(True, "BTC", "call", now_ms + 24 * hour, 80_000.0, "BTC-80k-C-USDC", settle="USDC"),
+        "coin": _FakeMarket(True, "BTC", "call", now_ms + 24 * hour, 80_000.0, "BTC-80k-C", settle="BTC"),
+    }
+    selected = select_near_1dte_option(_FakeDeribit(markets), "BTC", spot_price=80_000.0)
+    assert selected.symbol == "BTC-80k-C"
+
+
+def test_select_strikes_near_expiry_returns_n_nearest_sorted_by_moneyness():
+    import time
+
+    from ccxt_stream.select_option import select_strikes_near_expiry
+
+    now_ms = time.time() * 1000.0
+    hour = 3600_000.0
+    markets = {
+        f"k{k}": _FakeMarket(True, "BTC", "call", now_ms + 24 * hour, k, f"BTC-{k}-C")
+        for k in (70_000.0, 78_000.0, 80_000.0, 82_000.0, 90_000.0)
+    }
+    selected = select_strikes_near_expiry(_FakeDeribit(markets), "BTC", spot_price=80_000.0, n_strikes=3)
+    assert [o.strike for o in selected] == [80_000.0, 78_000.0, 82_000.0]
