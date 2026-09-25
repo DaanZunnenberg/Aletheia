@@ -18,6 +18,8 @@ from core.models.greeks_aggregator import (
 from core.models.glft import GLFTParams
 from core.models.ladder import LadderParams, LadderQuoteDecision, generate_ladder_quotes
 from core.models.options.black76 import OptionType, black76_greeks, black76_price
+from core.models.options.surface_quoting import StrikeQuote, fit_smile
+from core.models.options.svi import SVIParams
 from core.models.regime_monitor import RegimeState, classify_trend_regime, classify_vol_regime
 from core.models.volatility import ema_drift, ewma_volatility
 from core.risk.limits import RiskLimits
@@ -386,6 +388,31 @@ class PaperTradingEngine:
         self._register_resting_ladder(spec.key, ladder, update)
         self._maybe_hard_hedge(spec.underlying_ccy, update)
 
+    def _fit_smile_for(self, spec: QuotedOption, underlying_price: float, time_to_expiry: float) -> SVIParams | None:
+        """
+        Cross-section of live mids across every quoted strike sharing
+        spec's underlying currency and expiry -- None (falls back to flat
+        vol) unless at least surface_quoting.MIN_STRIKES_FOR_SVI of them
+        currently have a live book. With this project's original
+        single-strike-per-currency convention this always returns None;
+        it only activates once paper.instruments.find_strikes_near_the_money()
+        is used to discover more than one strike (see
+        examples/paper_trading_bot.py).
+        """
+        quotes = []
+        for other in self._quoted_options.values():
+            if other.underlying_ccy != spec.underlying_ccy or other.expiration_timestamp_ms != spec.expiration_timestamp_ms:
+                continue
+            book = self.latest_books.get(other.key)
+            if book is None or not book.bids or not book.asks:
+                continue
+            quotes.append(StrikeQuote(
+                strike=other.strike,
+                mid_price_usd=book.mid_price * underlying_price,  # Deribit coin-denominated mid -> USD, same convention as option_quoting's own inverse conversion
+                option_type=other.option_type,
+            ))
+        return fit_smile(underlying_price, time_to_expiry, quotes)
+
     def _handle_option_update(self, update: OrderBookUpdate) -> None:
         spec = self._quoted_options[update.key]
 
@@ -397,12 +424,14 @@ class PaperTradingEngine:
         time_to_expiry = max(
             (spec.expiration_timestamp_ms - update.timestamp) / 1000.0 / _SECONDS_PER_YEAR, 0.0
         )
+        svi_params = self._fit_smile_for(spec, underlying_book.microprice, time_to_expiry)
         quote = generate_option_quote(
             underlying_price=underlying_book.microprice,
             time_to_expiry_years=time_to_expiry,
             realized_vol=sigma,
             strike=spec.strike,
             option_type=spec.option_type,
+            svi_params=svi_params,
         )
         self._register_resting_quote(spec.key, quote, update)
         self._refresh_portfolio_greeks(spec.underlying_ccy, update)

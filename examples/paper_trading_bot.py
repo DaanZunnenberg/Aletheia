@@ -5,8 +5,12 @@ quotes against them in real time.
 
 Perps: Avellaneda-Stoikov (core/), with a soft delta-hedge inventory
 override from the option book's aggregated Black-76 Greeks
-(core/models/greeks_aggregator.py, paper/hedger.py). Options: Black-76 off
-realized vol (paper/option_quoting.py), size scaled down near expiry+strike
+(core/models/greeks_aggregator.py, paper/hedger.py). Options: a
+5-strikes-per-currency cross-section is quoted (paper/instruments.py's
+find_strikes_near_the_money()), each priced off a live SVI smile fit from
+that cross-section's own mids (core/models/options/surface_quoting.py) when
+enough strikes have a live book, falling back to flat realized-vol Black-76
+(paper/option_quoting.py) otherwise -- size scaled down near expiry+strike
 (pin risk, core/risk/pin_risk.py). A hard delta-band breach fires an
 immediate (paper) taker hedge against the Deribit perp itself
 (paper/hedger.py, paper/execution_latency.py for slippage).
@@ -44,14 +48,15 @@ from exchanges.deribit_trades import DeribitTradeStreamConnector
 from exchanges.stream_manager import MultiExchangeStreamManager, StreamSpec
 from paper.dashboard import MarketDashboard
 from paper.engine import PaperTradingEngine, QuotedOption, QuotedPerp
-from paper.instruments import find_near_the_money_option
+from paper.instruments import find_strikes_near_the_money
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
 _DERIBIT_PERP = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL"}
 _BINANCE_SYMBOL = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
-_APPROX_SPOT = {"BTC": 80_000.0, "ETH": 3_000.0}  # only used to pick a near-the-money strike at startup
+_APPROX_SPOT = {"BTC": 80_000.0, "ETH": 3_000.0}  # only used to pick near-the-money strikes at startup
+_N_STRIKES_PER_CCY = 5  # cross-section for paper.engine's live SVI smile fit (core.models.options.surface_quoting) -- below MIN_STRIKES_FOR_SVI the engine falls back to flat vol anyway
 
 
 async def _discover_options() -> list[QuotedOption]:
@@ -59,18 +64,19 @@ async def _discover_options() -> list[QuotedOption]:
     quoted_options = []
     try:
         for currency in ("BTC", "ETH"):
-            opt = await find_near_the_money_option(client, currency, _APPROX_SPOT[currency], "call")
-            log.info("selected option for %s: %s (strike=%.0f)", currency, opt.instrument_name, opt.strike)
-            quoted_options.append(
-                QuotedOption(
-                    key=("deribit", "option", opt.instrument_name),
-                    underlying_ccy=currency,
-                    underlying_key=("deribit", "perpetual", _DERIBIT_PERP[currency]),
-                    strike=opt.strike,
-                    option_type=OptionType.CALL,
-                    expiration_timestamp_ms=opt.expiration_timestamp_ms,
+            opts = await find_strikes_near_the_money(client, currency, _APPROX_SPOT[currency], n_strikes=_N_STRIKES_PER_CCY, option_type="call")
+            log.info("selected %d strikes for %s: %s", len(opts), currency, [f"{o.instrument_name}" for o in opts])
+            for opt in opts:
+                quoted_options.append(
+                    QuotedOption(
+                        key=("deribit", "option", opt.instrument_name),
+                        underlying_ccy=currency,
+                        underlying_key=("deribit", "perpetual", _DERIBIT_PERP[currency]),
+                        strike=opt.strike,
+                        option_type=OptionType.CALL,
+                        expiration_timestamp_ms=opt.expiration_timestamp_ms,
+                    )
                 )
-            )
     finally:
         await client.close()
     return quoted_options
