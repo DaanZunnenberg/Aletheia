@@ -6,6 +6,7 @@ import pytest
 
 from ccxt_stream.connector import CCXTOrderBookConnector
 from ccxt_stream.select_option import select_near_1dte_option
+from ccxt_stream.trades import CCXTTradeStreamConnector
 
 
 def test_requested_depth_rounds_up_to_a_valid_ccxt_depth():
@@ -114,3 +115,42 @@ def test_select_strikes_near_expiry_returns_n_nearest_sorted_by_moneyness():
     }
     selected = select_strikes_near_expiry(_FakeDeribit(markets), "BTC", spot_price=80_000.0, n_strikes=3)
     assert [o.strike for o in selected] == [80_000.0, 78_000.0, 82_000.0]
+
+
+class _FakeCcxtProExchange:
+    """Fake ccxt.pro exchange: one watch_trades_for_symbols call, then raises to end the stream cleanly in a test."""
+
+    def __init__(self, batches: list[list[dict]]) -> None:
+        self._batches = list(batches)
+
+    async def watch_trades_for_symbols(self, symbols):
+        if not self._batches:
+            raise StopAsyncIteration
+        return self._batches.pop(0)
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_stream_trades_drops_zero_price_or_amount_phantom_trades(monkeypatch):
+    # Observed live on Binance USDT-M via ccxt.pro: occasional phantom
+    # trades with price=0.0/amount=0.0, a real trade_id, no index/mark
+    # price -- not a real fill, and left unfiltered it corrupts every
+    # downstream consumer (log(price) in vol/bar building) with a zero/NaN
+    # cascade. See ccxt_stream/record.py's real recordings for the origin.
+    real_trade = {"symbol": "BTC/USDT:USDT", "price": 90_000.0, "amount": 1.5, "side": "buy", "timestamp": 1_700_000_000_000, "id": "1"}
+    phantom_price = {"symbol": "BTC/USDT:USDT", "price": 0.0, "amount": 0.0, "side": "buy", "timestamp": 1_700_000_000_001, "id": "2"}
+    phantom_amount = {"symbol": "BTC/USDT:USDT", "price": 90_001.0, "amount": 0.0, "side": "sell", "timestamp": 1_700_000_000_002, "id": "3"}
+
+    connector = CCXTTradeStreamConnector("binanceusdm")
+    connector._exchange = _FakeCcxtProExchange([[real_trade, phantom_price, phantom_amount]])
+
+    trades = []
+    async for trade in connector.stream_trades(["BTC/USDT:USDT"]):
+        trades.append(trade)
+        if len(trades) >= 1:
+            break
+
+    assert len(trades) == 1
+    assert trades[0]["trade_id"] == "1"

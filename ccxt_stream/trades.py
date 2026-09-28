@@ -52,10 +52,21 @@ class CCXTTradeStreamConnector:
                 continue
 
             for trade in trades:
+                price = float(trade["price"])
+                amount = float(trade["amount"])
+                if price <= 0.0 or amount <= 0.0:
+                    # Observed live on Binance USDT-M via ccxt.pro: occasional
+                    # phantom trades with price=0.0, amount=0.0 (real trade_id,
+                    # no index/mark price) -- not a real fill. Recording these
+                    # silently corrupts every downstream consumer of the trade
+                    # tape (log(price) in vol/bar building, VPIN, queue fills)
+                    # with a zero/NaN cascade, so drop them at the source rather
+                    # than pushing the filter onto every reader.
+                    continue
                 yield CCXTTrade(
                     instrument_name=trade["symbol"],
-                    price=float(trade["price"]),
-                    amount=float(trade["amount"]),
+                    price=price,
+                    amount=amount,
                     direction=trade["side"] or "buy",
                     timestamp=float(trade["timestamp"]) if trade.get("timestamp") is not None else 0.0,
                     trade_id=trade.get("id"),
