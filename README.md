@@ -72,3 +72,4 @@ Everything here is dry-run: live examples print quotes, they place no
 orders. Order execution is not implemented yet.
 
 <!-- Last reviewed: 2026-11-03 -->
+<!-- Last reviewed: 2026-11-04 -->
